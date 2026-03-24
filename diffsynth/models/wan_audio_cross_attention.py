@@ -28,7 +28,10 @@ class FantasyTalkingAudioConditionModel(nn.Module):
 
     用法:
     1) 初始化: adapter = FantasyTalkingAudioConditionModel(pipe.dit, 768, 2048)
-    2) 推理时给 pipe.dit.forward 透传 audio_embedding / audio_scale
+    2) 推理时给 pipe.dit.forward 透传:
+       - audio_embedding (wav2vec, 帧对齐分支)
+       - global_audio_embedding 或 emotion_audio_embedding (emotion2vec, 全局分支)
+       - audio_scale / audio_frame_scale / audio_global_scale
     3) 如需移除挂载: adapter.remove()
     """
 
@@ -37,6 +40,7 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         wan_dit: WanModel,
         audio_in_dim: int,
         audio_proj_dim: int,
+        global_audio_in_dim: Optional[int] = None,
         inject_layers: Optional[List[int]] = None,
         num_heads: Optional[int] = None,
         enable_frame_aligned_attn: bool = True,
@@ -44,14 +48,21 @@ class FantasyTalkingAudioConditionModel(nn.Module):
     ):
         super().__init__()
         self.wan_dit = wan_dit
+        # audio_in_dim: 帧对齐分支（默认用于 wav2vec）
+        # global_audio_in_dim: 全局分支（默认用于 emotion2vec），未提供时回退到 audio_in_dim
         self.audio_in_dim = audio_in_dim
+        self.global_audio_in_dim = global_audio_in_dim if global_audio_in_dim is not None else audio_in_dim
         self.audio_proj_dim = audio_proj_dim
         self.inject_layers = inject_layers or [0, 4, 8, 12, 16, 20, 24, 27]
         self.num_heads = num_heads or wan_dit.blocks[0].num_heads
         self.enable_frame_aligned_attn = enable_frame_aligned_attn
         self.enable_global_attn = enable_global_attn
 
-        self.proj_model = AudioProjModel(audio_in_dim=audio_in_dim, cross_attention_dim=audio_proj_dim)
+        # 两个分支使用不同音频编码器特征时，各自独立投影:
+        # - 帧对齐分支: wav2vec 特征
+        # - 全局分支: emotion2vec 特征
+        self.proj_model_frame = AudioProjModel(audio_in_dim=self.audio_in_dim, cross_attention_dim=audio_proj_dim)
+        self.proj_model_global = AudioProjModel(audio_in_dim=self.global_audio_in_dim, cross_attention_dim=audio_proj_dim)
         # -------- 分支1：帧对齐 cross-attention（逐帧）--------
         # 每个注入层前都做一次 pre-norm，稳定跨模态残差注入
         self.audio_pre_norm_frame = nn.ModuleList([
@@ -76,7 +87,8 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         # 若音频投影维度与 DiT hidden dim 不同，再做一次线性映射
         self.audio_proj_to_dit = nn.Identity() if audio_proj_dim == wan_dit.dim else nn.Linear(audio_proj_dim, wan_dit.dim, bias=False)
 
-        self._runtime_audio: Optional[torch.Tensor] = None
+        self._runtime_audio_frame: Optional[torch.Tensor] = None
+        self._runtime_audio_global: Optional[torch.Tensor] = None
         self._runtime_audio_scale: float = 1.0
         self._runtime_audio_frame_scale: float = 1.0
         self._runtime_audio_global_scale: float = 1.0
@@ -101,13 +113,19 @@ class FantasyTalkingAudioConditionModel(nn.Module):
     def _patch_wan_forward(self):
         def wrapped_forward(model_self, *args, **kwargs):
             # 额外消费两个外部参数，不影响原有 forward 参数签名
+            # audio_embedding: 帧对齐分支输入（wav2vec）
+            # global_audio_embedding / emotion_audio_embedding: 全局分支输入（emotion2vec）
             audio_embedding = kwargs.pop("audio_embedding", None)
+            global_audio_embedding = kwargs.pop("global_audio_embedding", None)
+            if global_audio_embedding is None:
+                global_audio_embedding = kwargs.pop("emotion_audio_embedding", None)
             # audio_scale: 总体缩放；frame/global_scale: 分支缩放
             audio_scale = float(kwargs.pop("audio_scale", 1.0))
             frame_scale = float(kwargs.pop("audio_frame_scale", 1.0))
             global_scale = float(kwargs.pop("audio_global_scale", 1.0))
-            # 先投影到统一维度，后续 block hook 直接使用
-            self._runtime_audio = self.get_proj_fea(audio_embedding) if audio_embedding is not None else None
+            # 先分别投影到统一维度，后续 block hook 直接使用
+            self._runtime_audio_frame = self.get_proj_fea(audio_embedding, branch="frame") if audio_embedding is not None else None
+            self._runtime_audio_global = self.get_proj_fea(global_audio_embedding, branch="global") if global_audio_embedding is not None else None
             self._runtime_audio_scale = audio_scale
             self._runtime_audio_frame_scale = frame_scale
             self._runtime_audio_global_scale = global_scale
@@ -116,7 +134,8 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                 return self._orig_forward(*args, **kwargs)
             finally:
                 # 清理 runtime 状态，避免跨 batch 污染
-                self._runtime_audio = None
+                self._runtime_audio_frame = None
+                self._runtime_audio_global = None
                 self._runtime_frames = None
                 self._runtime_audio_scale = 1.0
                 self._runtime_audio_frame_scale = 1.0
@@ -130,7 +149,7 @@ class FantasyTalkingAudioConditionModel(nn.Module):
 
     def _make_block_hook(self, block_idx: int):
         def block_hook(module, inputs, output):
-            if self._runtime_audio is None:
+            if self._runtime_audio_frame is None and self._runtime_audio_global is None:
                 return output
 
             injector_idx = self._block_id_map.get(block_idx)
@@ -138,43 +157,50 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                 return output
 
             hidden_states = output
-            audio = self.audio_proj_to_dit(self._runtime_audio).to(dtype=hidden_states.dtype, device=hidden_states.device)
-
-            if audio.dim() == 3:
-                audio = audio.unsqueeze(2)
-            if audio.dim() != 4:
-                raise ValueError(f"audio_embedding must be [B,T,C] or [B,T,N,C], got shape={tuple(audio.shape)}")
-
-            # 严格逐帧对齐: 每个视频 latent 帧只与对应音频帧做 cross-attention
-            num_frames = self._runtime_frames or audio.shape[1]
-            if audio.shape[1] != num_frames:
-                raise ValueError(
-                    f"audio/video frame mismatch in cross-attention: video={num_frames}, audio={audio.shape[1]}"
-                )
-
-            seq_len = hidden_states.shape[1]
-            if seq_len % num_frames != 0:
-                raise ValueError(
-                    f"hidden token length {seq_len} is not divisible by frame count {num_frames}"
-                )
-
             residual_sum = 0
 
-            if self.enable_frame_aligned_attn:
+            # ===== 1) 帧对齐分支（wav2vec）=====
+            if self.enable_frame_aligned_attn and self._runtime_audio_frame is not None:
+                frame_audio = self.audio_proj_to_dit(self._runtime_audio_frame).to(dtype=hidden_states.dtype, device=hidden_states.device)
+                if frame_audio.dim() == 3:
+                    frame_audio = frame_audio.unsqueeze(2)
+                if frame_audio.dim() != 4:
+                    raise ValueError(f"frame audio_embedding must be [B,T,C] or [B,T,N,C], got shape={tuple(frame_audio.shape)}")
+
+                # 严格逐帧对齐: 每个视频 latent 帧只与对应音频帧做 cross-attention
+                num_frames = self._runtime_frames or frame_audio.shape[1]
+                if frame_audio.shape[1] != num_frames:
+                    raise ValueError(
+                        f"frame audio/video mismatch: video={num_frames}, frame_audio={frame_audio.shape[1]}"
+                    )
+
+                seq_len = hidden_states.shape[1]
+                if seq_len % num_frames != 0:
+                    raise ValueError(
+                        f"hidden token length {seq_len} is not divisible by frame count {num_frames}"
+                    )
+
                 # [B, T*N, C] -> [B*T, N, C]，把每一帧拆开单独做 cross-attention
                 frame_hidden = rearrange(hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
                 frame_hidden = self.audio_pre_norm_frame[injector_idx](frame_hidden)
-                frame_audio = rearrange(audio, "b t n c -> (b t) n c", t=num_frames)
-                frame_residual = self.audio_injector_frame[injector_idx](frame_hidden, frame_audio)
+                frame_audio_tokens = rearrange(frame_audio, "b t n c -> (b t) n c", t=num_frames)
+                frame_residual = self.audio_injector_frame[injector_idx](frame_hidden, frame_audio_tokens)
                 # 回拼到原序列并做残差融合
                 frame_residual = rearrange(frame_residual, "(b t) n c -> b (t n) c", t=num_frames)
                 residual_sum = residual_sum + frame_residual * self._runtime_audio_frame_scale
 
-            if self.enable_global_attn:
+            # ===== 2) 全局分支（emotion2vec）=====
+            if self.enable_global_attn and self._runtime_audio_global is not None:
                 # 全局分支：视频整段 token 与整段音频 token 做 cross-attention
                 global_hidden = self.audio_pre_norm_global[injector_idx](hidden_states)
-                global_audio = rearrange(audio, "b t n c -> b (t n) c")
-                global_residual = self.audio_injector_global[injector_idx](global_hidden, global_audio)
+                global_audio = self.audio_proj_to_dit(self._runtime_audio_global).to(dtype=hidden_states.dtype, device=hidden_states.device)
+                if global_audio.dim() == 4:
+                    global_audio_tokens = rearrange(global_audio, "b t n c -> b (t n) c")
+                elif global_audio.dim() == 3:
+                    global_audio_tokens = global_audio
+                else:
+                    raise ValueError(f"global audio_embedding must be [B,L,C] or [B,T,N,C], got shape={tuple(global_audio.shape)}")
+                global_residual = self.audio_injector_global[injector_idx](global_hidden, global_audio_tokens)
                 residual_sum = residual_sum + global_residual * self._runtime_audio_global_scale
 
             return hidden_states + residual_sum * self._runtime_audio_scale
@@ -188,14 +214,22 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         self._hooks = []
         self.wan_dit.forward = self._orig_forward
 
-    def get_proj_fea(self, audio_fea: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
-        return self.proj_model(audio_fea) if audio_fea is not None else None
+    def get_proj_fea(self, audio_fea: Optional[torch.Tensor] = None, branch: str = "frame") -> Optional[torch.Tensor]:
+        if audio_fea is None:
+            return None
+        if branch == "frame":
+            return self.proj_model_frame(audio_fea)
+        if branch == "global":
+            return self.proj_model_global(audio_fea)
+        raise ValueError(f"Unsupported branch: {branch}")
 
     def load_audio_processor(self, ip_ckpt: str, wan_dit: Optional[WanModel] = None):
         # 支持 safetensors 和普通 torch checkpoint
         if os.path.splitext(ip_ckpt)[-1] == ".safetensors":
             state_dict = {
                 "proj_model": {},
+                "proj_model_frame": {},
+                "proj_model_global": {},
                 "audio_injector_frame": {},
                 "audio_pre_norm_frame": {},
                 "audio_injector_global": {},
@@ -206,6 +240,10 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                 for key in f.keys():
                     if key.startswith("proj_model."):
                         state_dict["proj_model"][key.replace("proj_model.", "")] = f.get_tensor(key)
+                    elif key.startswith("proj_model_frame."):
+                        state_dict["proj_model_frame"][key.replace("proj_model_frame.", "")] = f.get_tensor(key)
+                    elif key.startswith("proj_model_global."):
+                        state_dict["proj_model_global"][key.replace("proj_model_global.", "")] = f.get_tensor(key)
                     elif key.startswith("audio_injector_frame."):
                         state_dict["audio_injector_frame"][key.replace("audio_injector_frame.", "")] = f.get_tensor(key)
                     elif key.startswith("audio_pre_norm_frame."):
@@ -224,8 +262,13 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         else:
             state_dict = torch.load(ip_ckpt, map_location="cpu")
 
-        if "proj_model" in state_dict:
-            self.proj_model.load_state_dict(state_dict["proj_model"], strict=True)
+        if "proj_model_frame" in state_dict and len(state_dict["proj_model_frame"]) > 0:
+            self.proj_model_frame.load_state_dict(state_dict["proj_model_frame"], strict=True)
+        if "proj_model_global" in state_dict and len(state_dict["proj_model_global"]) > 0:
+            self.proj_model_global.load_state_dict(state_dict["proj_model_global"], strict=True)
+        # 兼容老字段：只有一个 proj_model 时，默认加载到 frame 分支
+        if "proj_model" in state_dict and len(state_dict["proj_model"]) > 0:
+            self.proj_model_frame.load_state_dict(state_dict["proj_model"], strict=True)
         if "audio_injector_frame" in state_dict:
             self.audio_injector_frame.load_state_dict(state_dict["audio_injector_frame"], strict=False)
         if "audio_pre_norm_frame" in state_dict:
