@@ -39,6 +39,8 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         audio_proj_dim: int,
         inject_layers: Optional[List[int]] = None,
         num_heads: Optional[int] = None,
+        enable_frame_aligned_attn: bool = True,
+        enable_global_attn: bool = True,
     ):
         super().__init__()
         self.wan_dit = wan_dit
@@ -46,15 +48,28 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         self.audio_proj_dim = audio_proj_dim
         self.inject_layers = inject_layers or [0, 4, 8, 12, 16, 20, 24, 27]
         self.num_heads = num_heads or wan_dit.blocks[0].num_heads
+        self.enable_frame_aligned_attn = enable_frame_aligned_attn
+        self.enable_global_attn = enable_global_attn
 
         self.proj_model = AudioProjModel(audio_in_dim=audio_in_dim, cross_attention_dim=audio_proj_dim)
+        # -------- 分支1：帧对齐 cross-attention（逐帧）--------
         # 每个注入层前都做一次 pre-norm，稳定跨模态残差注入
-        self.audio_pre_norm = nn.ModuleList([
+        self.audio_pre_norm_frame = nn.ModuleList([
             nn.LayerNorm(wan_dit.dim, elementwise_affine=False, eps=1e-6)
             for _ in self.inject_layers
         ])
-        # 注入器本质是 CrossAttention(Q=视频token, K/V=音频token)
-        self.audio_injector = nn.ModuleList([
+        # 注入器本质是 CrossAttention(Q=视频token, K/V=对应帧音频token)
+        self.audio_injector_frame = nn.ModuleList([
+            CrossAttention(dim=wan_dit.dim, num_heads=self.num_heads)
+            for _ in self.inject_layers
+        ])
+        # -------- 分支2：全局 cross-attention（整段）--------
+        # Q 仍然是全部视频 token，K/V 是整个音频序列（跨所有帧）
+        self.audio_pre_norm_global = nn.ModuleList([
+            nn.LayerNorm(wan_dit.dim, elementwise_affine=False, eps=1e-6)
+            for _ in self.inject_layers
+        ])
+        self.audio_injector_global = nn.ModuleList([
             CrossAttention(dim=wan_dit.dim, num_heads=self.num_heads)
             for _ in self.inject_layers
         ])
@@ -63,6 +78,8 @@ class FantasyTalkingAudioConditionModel(nn.Module):
 
         self._runtime_audio: Optional[torch.Tensor] = None
         self._runtime_audio_scale: float = 1.0
+        self._runtime_audio_frame_scale: float = 1.0
+        self._runtime_audio_global_scale: float = 1.0
         self._runtime_frames: Optional[int] = None
 
         self._block_id_map = {layer_id: idx for idx, layer_id in enumerate(self.inject_layers)}
@@ -85,10 +102,15 @@ class FantasyTalkingAudioConditionModel(nn.Module):
         def wrapped_forward(model_self, *args, **kwargs):
             # 额外消费两个外部参数，不影响原有 forward 参数签名
             audio_embedding = kwargs.pop("audio_embedding", None)
+            # audio_scale: 总体缩放；frame/global_scale: 分支缩放
             audio_scale = float(kwargs.pop("audio_scale", 1.0))
+            frame_scale = float(kwargs.pop("audio_frame_scale", 1.0))
+            global_scale = float(kwargs.pop("audio_global_scale", 1.0))
             # 先投影到统一维度，后续 block hook 直接使用
             self._runtime_audio = self.get_proj_fea(audio_embedding) if audio_embedding is not None else None
             self._runtime_audio_scale = audio_scale
+            self._runtime_audio_frame_scale = frame_scale
+            self._runtime_audio_global_scale = global_scale
             self._runtime_frames = None
             try:
                 return self._orig_forward(*args, **kwargs)
@@ -97,6 +119,8 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                 self._runtime_audio = None
                 self._runtime_frames = None
                 self._runtime_audio_scale = 1.0
+                self._runtime_audio_frame_scale = 1.0
+                self._runtime_audio_global_scale = 1.0
 
         self.wan_dit.forward = MethodType(wrapped_forward, self.wan_dit)
 
@@ -134,15 +158,26 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                     f"hidden token length {seq_len} is not divisible by frame count {num_frames}"
                 )
 
-            # [B, T*N, C] -> [B*T, N, C]，把每一帧拆开单独做 cross-attention
-            attn_hidden_states = rearrange(hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-            attn_hidden_states = self.audio_pre_norm[injector_idx](attn_hidden_states)
-            attn_audio = rearrange(audio, "b t n c -> (b t) n c", t=num_frames)
+            residual_sum = 0
 
-            residual = self.audio_injector[injector_idx](attn_hidden_states, attn_audio)
-            # 回拼到原序列并做残差融合
-            residual = rearrange(residual, "(b t) n c -> b (t n) c", t=num_frames)
-            return hidden_states + residual * self._runtime_audio_scale
+            if self.enable_frame_aligned_attn:
+                # [B, T*N, C] -> [B*T, N, C]，把每一帧拆开单独做 cross-attention
+                frame_hidden = rearrange(hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
+                frame_hidden = self.audio_pre_norm_frame[injector_idx](frame_hidden)
+                frame_audio = rearrange(audio, "b t n c -> (b t) n c", t=num_frames)
+                frame_residual = self.audio_injector_frame[injector_idx](frame_hidden, frame_audio)
+                # 回拼到原序列并做残差融合
+                frame_residual = rearrange(frame_residual, "(b t) n c -> b (t n) c", t=num_frames)
+                residual_sum = residual_sum + frame_residual * self._runtime_audio_frame_scale
+
+            if self.enable_global_attn:
+                # 全局分支：视频整段 token 与整段音频 token 做 cross-attention
+                global_hidden = self.audio_pre_norm_global[injector_idx](hidden_states)
+                global_audio = rearrange(audio, "b t n c -> b (t n) c")
+                global_residual = self.audio_injector_global[injector_idx](global_hidden, global_audio)
+                residual_sum = residual_sum + global_residual * self._runtime_audio_global_scale
+
+            return hidden_states + residual_sum * self._runtime_audio_scale
 
         return block_hook
 
@@ -159,15 +194,31 @@ class FantasyTalkingAudioConditionModel(nn.Module):
     def load_audio_processor(self, ip_ckpt: str, wan_dit: Optional[WanModel] = None):
         # 支持 safetensors 和普通 torch checkpoint
         if os.path.splitext(ip_ckpt)[-1] == ".safetensors":
-            state_dict = {"proj_model": {}, "audio_injector": {}, "audio_pre_norm": {}, "audio_proj_to_dit": {}}
+            state_dict = {
+                "proj_model": {},
+                "audio_injector_frame": {},
+                "audio_pre_norm_frame": {},
+                "audio_injector_global": {},
+                "audio_pre_norm_global": {},
+                "audio_proj_to_dit": {}
+            }
             with safe_open(ip_ckpt, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     if key.startswith("proj_model."):
                         state_dict["proj_model"][key.replace("proj_model.", "")] = f.get_tensor(key)
+                    elif key.startswith("audio_injector_frame."):
+                        state_dict["audio_injector_frame"][key.replace("audio_injector_frame.", "")] = f.get_tensor(key)
+                    elif key.startswith("audio_pre_norm_frame."):
+                        state_dict["audio_pre_norm_frame"][key.replace("audio_pre_norm_frame.", "")] = f.get_tensor(key)
+                    elif key.startswith("audio_injector_global."):
+                        state_dict["audio_injector_global"][key.replace("audio_injector_global.", "")] = f.get_tensor(key)
+                    elif key.startswith("audio_pre_norm_global."):
+                        state_dict["audio_pre_norm_global"][key.replace("audio_pre_norm_global.", "")] = f.get_tensor(key)
+                    # 兼容旧权重命名（只有单分支时）
                     elif key.startswith("audio_injector."):
-                        state_dict["audio_injector"][key.replace("audio_injector.", "")] = f.get_tensor(key)
+                        state_dict["audio_injector_frame"][key.replace("audio_injector.", "")] = f.get_tensor(key)
                     elif key.startswith("audio_pre_norm."):
-                        state_dict["audio_pre_norm"][key.replace("audio_pre_norm.", "")] = f.get_tensor(key)
+                        state_dict["audio_pre_norm_frame"][key.replace("audio_pre_norm.", "")] = f.get_tensor(key)
                     elif key.startswith("audio_proj_to_dit."):
                         state_dict["audio_proj_to_dit"][key.replace("audio_proj_to_dit.", "")] = f.get_tensor(key)
         else:
@@ -175,10 +226,19 @@ class FantasyTalkingAudioConditionModel(nn.Module):
 
         if "proj_model" in state_dict:
             self.proj_model.load_state_dict(state_dict["proj_model"], strict=True)
+        if "audio_injector_frame" in state_dict:
+            self.audio_injector_frame.load_state_dict(state_dict["audio_injector_frame"], strict=False)
+        if "audio_pre_norm_frame" in state_dict:
+            self.audio_pre_norm_frame.load_state_dict(state_dict["audio_pre_norm_frame"], strict=False)
+        if "audio_injector_global" in state_dict:
+            self.audio_injector_global.load_state_dict(state_dict["audio_injector_global"], strict=False)
+        if "audio_pre_norm_global" in state_dict:
+            self.audio_pre_norm_global.load_state_dict(state_dict["audio_pre_norm_global"], strict=False)
+        # 兼容旧 checkpoint 字段（单分支）
         if "audio_injector" in state_dict:
-            self.audio_injector.load_state_dict(state_dict["audio_injector"], strict=False)
+            self.audio_injector_frame.load_state_dict(state_dict["audio_injector"], strict=False)
         if "audio_pre_norm" in state_dict:
-            self.audio_pre_norm.load_state_dict(state_dict["audio_pre_norm"], strict=False)
+            self.audio_pre_norm_frame.load_state_dict(state_dict["audio_pre_norm"], strict=False)
         if "audio_proj_to_dit" in state_dict and hasattr(self.audio_proj_to_dit, "load_state_dict"):
             self.audio_proj_to_dit.load_state_dict(state_dict["audio_proj_to_dit"], strict=False)
 
