@@ -3,6 +3,7 @@ import os
 
 import torch
 from PIL import Image
+import numpy as np
 
 from diffsynth import ModelManager
 from diffsynth.pipelines.wan_video import WanVideoPipeline
@@ -16,8 +17,11 @@ def parse_args():
     parser.add_argument("--reference_image", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--negative_prompt", type=str, default="")
-    parser.add_argument("--wav2vec_feature", type=str, required=True, help="Path to wav2vec feature tensor (.pt/.pth), shape [B,T,C] or [T,C]")
-    parser.add_argument("--emotion2vec_feature", type=str, required=True, help="Path to emotion2vec feature tensor (.pt/.pth), shape [B,L,C] or [L,C]")
+    parser.add_argument("--wav2vec_feature", type=str, default="", help="Path to wav2vec feature tensor (.pt/.pth), shape [B,T,C] or [T,C]")
+    parser.add_argument("--emotion2vec_feature", type=str, default="", help="Path to emotion2vec feature tensor (.pt/.pth), shape [B,L,C] or [L,C]")
+    parser.add_argument("--input_audio", type=str, default="", help="Raw audio path. If provided and feature files are empty, script extracts wav2vec/emotion2vec features online.")
+    parser.add_argument("--wav2vec_model_id", type=str, default="facebook/wav2vec2-base-960h")
+    parser.add_argument("--emotion2vec_model_id", type=str, default="audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim")
     parser.add_argument("--fantasytalking_model_path", type=str, default="", help="Optional adapter checkpoint")
     parser.add_argument("--output", type=str, default="video_fantasytalking_wan.mp4")
     parser.add_argument("--height", type=int, default=480)
@@ -42,6 +46,38 @@ def load_feature(path: str, device: str, dtype: torch.dtype):
     if feat.dim() == 2:
         feat = feat.unsqueeze(0)
     return feat.to(device=device, dtype=dtype)
+
+
+def load_waveform(audio_path: str):
+    try:
+        import soundfile as sf
+        wav, sr = sf.read(audio_path)
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+        return wav.astype(np.float32), sr
+    except Exception:
+        import torchaudio
+        wav, sr = torchaudio.load(audio_path)
+        wav = wav.mean(dim=0).numpy().astype(np.float32)
+        return wav, sr
+
+
+def extract_hf_audio_features(waveform, sample_rate, model_id, device, dtype):
+    from transformers import AutoFeatureExtractor, AutoModel
+    extractor = AutoFeatureExtractor.from_pretrained(model_id)
+    model = AutoModel.from_pretrained(model_id).to(device=device, dtype=dtype)
+    model.eval()
+    inputs = extractor(
+        waveform,
+        sampling_rate=sample_rate,
+        return_tensors="pt",
+        padding=True,
+    )
+    inputs = {k: v.to(device=device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs)
+    hidden = outputs.last_hidden_state
+    return hidden
 
 
 def main():
@@ -82,8 +118,21 @@ def main():
         fantasytalking.load_audio_processor(args.fantasytalking_model_path, pipe.dit)
 
     # 3) 读取两路音频特征并投影
-    wav2vec_fea = load_feature(args.wav2vec_feature, device, dtype)
-    emo2vec_fea = load_feature(args.emotion2vec_feature, device, dtype)
+    if args.wav2vec_feature and args.emotion2vec_feature:
+        wav2vec_fea = load_feature(args.wav2vec_feature, device, dtype)
+        emo2vec_fea = load_feature(args.emotion2vec_feature, device, dtype)
+    else:
+        if not args.input_audio:
+            raise ValueError("Please provide either --wav2vec_feature/--emotion2vec_feature or --input_audio.")
+        waveform, sample_rate = load_waveform(args.input_audio)
+        # 帧对齐分支：wav2vec 特征
+        wav2vec_fea = extract_hf_audio_features(
+            waveform, sample_rate, args.wav2vec_model_id, device, dtype
+        )
+        # 全局分支：emotion2vec 特征（默认使用 emotion 领域模型）
+        emo2vec_fea = extract_hf_audio_features(
+            waveform, sample_rate, args.emotion2vec_model_id, device, dtype
+        )
 
     audio_proj = fantasytalking.get_proj_fea(wav2vec_fea, branch="frame")
     audio_proj_global = fantasytalking.get_proj_fea(emo2vec_fea, branch="global")
