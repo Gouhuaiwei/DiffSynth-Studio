@@ -182,23 +182,35 @@ class CrossAttention(nn.Module):
             self.norm_k_img = RMSNorm(dim, eps=eps)
             
         self.attn = AttentionModule(self.num_heads)
+        self.set_processor(CrossAttentionProcessor())
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
-        if self.has_image_input:
+    def set_processor(self, processor):
+        self.processor = processor
+
+    def get_processor(self):
+        return self.processor
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, **kwargs):
+        return self.processor(self, x, y, **kwargs)
+
+
+class CrossAttentionProcessor:
+    def __call__(self, attn: CrossAttention, x: torch.Tensor, y: torch.Tensor, **kwargs):
+        if attn.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
         else:
             ctx = y
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(ctx))
-        v = self.v(ctx)
-        x = self.attn(q, k, v)
-        if self.has_image_input:
-            k_img = self.norm_k_img(self.k_img(img))
-            v_img = self.v_img(img)
-            y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+        q = attn.norm_q(attn.q(x))
+        k = attn.norm_k(attn.k(ctx))
+        v = attn.v(ctx)
+        x = attn.attn(q, k, v)
+        if attn.has_image_input:
+            k_img = attn.norm_k_img(attn.k_img(img))
+            v_img = attn.v_img(img)
+            y = flash_attention(q, k_img, v_img, num_heads=attn.num_heads)
             x = x + y
-        return self.o(x)
+        return attn.o(x)
 
 
 class GateModule(nn.Module):
@@ -226,7 +238,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, **kwargs):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -239,7 +251,7 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x = x + self.cross_attn(self.norm3(x), context, **kwargs)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
@@ -338,6 +350,39 @@ class WanToDanceInjector(nn.Module):
 class WanModel(torch.nn.Module):
 
     _repeated_blocks = ["DiTBlock"]
+
+    @property
+    def attn_processors(self):
+        processors = {}
+
+        def fn_recursive_add_processors(name: str, module: torch.nn.Module):
+            if hasattr(module, "set_processor") and hasattr(module, "processor"):
+                processors[f"{name}.processor"] = module.processor
+            for sub_name, child in module.named_children():
+                fn_recursive_add_processors(f"{name}.{sub_name}", child)
+
+        for name, module in self.named_children():
+            fn_recursive_add_processors(name, module)
+        return processors
+
+    def set_attn_processor(self, processor):
+        count = len(self.attn_processors.keys())
+        if isinstance(processor, dict) and len(processor) != count:
+            raise ValueError(
+                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the number of attention layers: {count}."
+            )
+
+        def fn_recursive_attn_processor(name: str, module: torch.nn.Module):
+            if hasattr(module, "set_processor"):
+                if not isinstance(processor, dict):
+                    module.set_processor(processor)
+                else:
+                    module.set_processor(processor.pop(f"{name}.processor"))
+            for sub_name, child in module.named_children():
+                fn_recursive_attn_processor(f"{name}.{sub_name}", child)
+
+        for name, module in self.named_children():
+            fn_recursive_attn_processor(name, module)
 
     def __init__(
         self,
@@ -515,6 +560,12 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                audio_proj: Optional[torch.Tensor] = None,
+                audio_proj_global: Optional[torch.Tensor] = None,
+                latents_num_frames: Optional[int] = None,
+                audio_scale: float = 1.0,
+                audio_frame_scale: float = 1.0,
+                audio_global_scale: float = 1.0,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -541,10 +592,24 @@ class WanModel(torch.nn.Module):
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs,
+                    audio_proj=audio_proj,
+                    audio_proj_global=audio_proj_global,
+                    latents_num_frames=latents_num_frames if latents_num_frames is not None else f,
+                    audio_scale=audio_scale,
+                    audio_frame_scale=audio_frame_scale,
+                    audio_global_scale=audio_global_scale,
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(
+                    x, context, t_mod, freqs,
+                    audio_proj=audio_proj,
+                    audio_proj_global=audio_proj_global,
+                    latents_num_frames=latents_num_frames if latents_num_frames is not None else f,
+                    audio_scale=audio_scale,
+                    audio_frame_scale=audio_frame_scale,
+                    audio_global_scale=audio_global_scale,
+                )
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
