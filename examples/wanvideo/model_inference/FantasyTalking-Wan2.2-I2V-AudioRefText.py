@@ -17,9 +17,7 @@ def parse_args():
     parser.add_argument("--reference_image", type=str, required=True)
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--negative_prompt", type=str, default="")
-    parser.add_argument("--wav2vec_feature", type=str, default="", help="Path to wav2vec feature tensor (.pt/.pth), shape [B,T,C] or [T,C]")
-    parser.add_argument("--emotion2vec_feature", type=str, default="", help="Path to emotion2vec feature tensor (.pt/.pth), shape [B,L,C] or [L,C]")
-    parser.add_argument("--input_audio", type=str, default="", help="Raw audio path. If provided and feature files are empty, script extracts wav2vec/emotion2vec features online.")
+    parser.add_argument("--input_audio", type=str, required=True, help="Raw audio path. wav2vec/emotion2vec features are extracted online.")
     parser.add_argument("--wav2vec_model_id", type=str, default="facebook/wav2vec2-base-960h")
     parser.add_argument("--emotion2vec_model_id", type=str, default="audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim")
     parser.add_argument("--fantasytalking_model_path", type=str, default="", help="Optional adapter checkpoint")
@@ -33,19 +31,6 @@ def parse_args():
     parser.add_argument("--audio_frame_scale", type=float, default=1.0)
     parser.add_argument("--audio_global_scale", type=float, default=1.0)
     return parser.parse_args()
-
-
-def load_feature(path: str, device: str, dtype: torch.dtype):
-    feat = torch.load(path, map_location="cpu")
-    if isinstance(feat, dict):
-        # 兼容常见保存格式
-        for key in ["features", "embeds", "audio_features", "x"]:
-            if key in feat:
-                feat = feat[key]
-                break
-    if feat.dim() == 2:
-        feat = feat.unsqueeze(0)
-    return feat.to(device=device, dtype=dtype)
 
 
 def load_waveform(audio_path: str):
@@ -117,22 +102,16 @@ def main():
     if args.fantasytalking_model_path and os.path.isfile(args.fantasytalking_model_path):
         fantasytalking.load_audio_processor(args.fantasytalking_model_path, pipe.dit)
 
-    # 3) 读取两路音频特征并投影
-    if args.wav2vec_feature and args.emotion2vec_feature:
-        wav2vec_fea = load_feature(args.wav2vec_feature, device, dtype)
-        emo2vec_fea = load_feature(args.emotion2vec_feature, device, dtype)
-    else:
-        if not args.input_audio:
-            raise ValueError("Please provide either --wav2vec_feature/--emotion2vec_feature or --input_audio.")
-        waveform, sample_rate = load_waveform(args.input_audio)
-        # 帧对齐分支：wav2vec 特征
-        wav2vec_fea = extract_hf_audio_features(
-            waveform, sample_rate, args.wav2vec_model_id, device, dtype
-        )
-        # 全局分支：emotion2vec 特征（默认使用 emotion 领域模型）
-        emo2vec_fea = extract_hf_audio_features(
-            waveform, sample_rate, args.emotion2vec_model_id, device, dtype
-        )
+    # 3) 从输入音频提取两路音频特征并投影
+    waveform, sample_rate = load_waveform(args.input_audio)
+    # 帧对齐分支：wav2vec 特征
+    wav2vec_fea = extract_hf_audio_features(
+        waveform, sample_rate, args.wav2vec_model_id, device, dtype
+    )
+    # 全局分支：emotion2vec 特征（默认使用 emotion 领域模型）
+    emo2vec_fea = extract_hf_audio_features(
+        waveform, sample_rate, args.emotion2vec_model_id, device, dtype
+    )
 
     audio_proj = fantasytalking.get_proj_fea(wav2vec_fea, branch="frame")
     audio_proj_global = fantasytalking.get_proj_fea(emo2vec_fea, branch="global")
