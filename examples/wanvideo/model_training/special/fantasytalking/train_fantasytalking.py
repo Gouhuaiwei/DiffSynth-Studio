@@ -9,11 +9,11 @@ import fairseq
 import accelerate
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from diffsynth import ModelManager, WanVideoPipeline
-from diffsynth.diffusion import FlowMatchSFTLoss
+from diffsynth.diffusion import DiffusionTrainingModule, FlowMatchSFTLoss, ModelLogger, launch_training_task
 from diffsynth.models.wan_audio_cross_attention import FantasyTalkingAudioConditionModel
 
 
@@ -29,6 +29,7 @@ class TensorSampleDataset(Dataset):
 
     def __init__(self, metadata_path: str):
         self.items = []
+        self.load_from_cache = False
         with open(metadata_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -43,13 +44,6 @@ class TensorSampleDataset(Dataset):
         sample = torch.load(item["model_input"], map_location="cpu")
         sample["audio_path"] = item["audio_path"]
         return sample
-
-
-def collate_fn(batch):
-    # 当前脚本以 batch_size=1 为主，避免不同长度 audio 对齐复杂度
-    assert len(batch) == 1, "Please use batch_size=1 for this script."
-    return batch[0]
-
 
 def extract_wav2vec_feature(wav2vec, wav2vec_processor, audio_path: str):
     audio, sr = librosa.load(audio_path, sr=16000, mono=True)
@@ -113,177 +107,136 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_models(args):
-    # 1) Load Wan pipeline
-    model_manager = ModelManager(device="cpu")
-    model_manager.load_models(
-        [
+class FantasyTalkingTrainingModule(DiffusionTrainingModule):
+    def __init__(self, args, device):
+        super().__init__()
+        self.args = args
+        self.device = device
+        self.pipe, self.fantasytalking, self.wav2vec_processor, self.wav2vec, self.emotion2vec, self.emotion_normalize = self.load_models()
+        self.freeze_models()
+
+    def load_models(self):
+        model_manager = ModelManager(device="cpu")
+        model_manager.load_models(
             [
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00001-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00002-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00003-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00005-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00006-of-00007.safetensors",
-                f"{args.wan_model_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
+                [
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00001-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00002-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00003-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00005-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00006-of-00007.safetensors",
+                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
+                ],
+                f"{self.args.wan_model_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                f"{self.args.wan_model_dir}/models_t5_umt5-xxl-enc-bf16.pth",
+                f"{self.args.wan_model_dir}/Wan2.1_VAE.pth",
             ],
-            f"{args.wan_model_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-            f"{args.wan_model_dir}/models_t5_umt5-xxl-enc-bf16.pth",
-            f"{args.wan_model_dir}/Wan2.1_VAE.pth",
-        ],
-        torch_dtype=torch.bfloat16,
-    )
-    pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
+            torch_dtype=torch.bfloat16,
+        )
+        pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device=self.device)
+        fantasytalking = FantasyTalkingAudioConditionModel(
+            pipe.dit,
+            audio_in_dim=self.args.audio_in_dim,
+            audio_proj_dim=self.args.audio_proj_dim,
+            global_audio_in_dim=self.args.global_audio_in_dim,
+        ).to(self.device)
+        wav2vec_processor = Wav2Vec2Processor.from_pretrained(self.args.wav2vec_model_dir)
+        wav2vec = Wav2Vec2Model.from_pretrained(self.args.wav2vec_model_dir).to(self.device, dtype=torch.bfloat16).eval()
 
-    # 2) Install FantasyTalking adapter
-    fantasytalking = FantasyTalkingAudioConditionModel(
-        pipe.dit,
-        audio_in_dim=args.audio_in_dim,
-        audio_proj_dim=args.audio_proj_dim,
-        global_audio_in_dim=args.global_audio_in_dim,
-    ).to("cuda")
+        @dataclass
+        class UserDirModule:
+            user_dir: str
 
-    # 3) Load audio encoders
-    wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
-    wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).to("cuda", dtype=torch.bfloat16).eval()
+        fairseq.utils.import_user_module(UserDirModule(self.args.emotion2vec_user_dir))
+        models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([self.args.emotion2vec_ckpt])
+        emotion2vec = models[0].eval().to(self.device)
+        emotion_normalize = bool(task.cfg.normalize)
+        return pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize
 
-    @dataclass
-    class UserDirModule:
-        user_dir: str
+    def freeze_models(self):
+        self.pipe.dit.requires_grad_(False)
+        self.wav2vec.requires_grad_(False)
+        self.emotion2vec.requires_grad_(False)
+        self.fantasytalking.requires_grad_(True)
+        for module in self.pipe.dit.modules():
+            if hasattr(module, "get_processor"):
+                processor = module.get_processor()
+                if processor.__class__.__name__ == "WanCrossAttentionProcessor":
+                    for p in processor.parameters():
+                        p.requires_grad_(True)
 
-    fairseq.utils.import_user_module(UserDirModule(args.emotion2vec_user_dir))
-    models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([args.emotion2vec_ckpt])
-    emotion2vec = models[0].eval().cuda()
-    emotion_normalize = bool(task.cfg.normalize)
-    return pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize
+    def export_trainable_state_dict(self, state_dict, remove_prefix=None):
+        return build_fantasytalking_checkpoint(self.fantasytalking, self.pipe.dit)
 
+    def forward(self, data, inputs=None):
+        sample = data if inputs is None else inputs
+        input_latents = sample["latents"].to(self.device, dtype=torch.bfloat16)
+        context = sample["context"].to(self.device, dtype=torch.bfloat16)
+        clip_feature = sample.get("clip_feature", None)
+        y = sample.get("y", None)
+        if clip_feature is not None:
+            clip_feature = clip_feature.to(self.device, dtype=torch.bfloat16)
+        if y is not None:
+            y = y.to(self.device, dtype=torch.bfloat16)
 
-def freeze_models(pipe, wav2vec, emotion2vec, fantasytalking):
-    # Freeze Wan + wav2vec + emotion2vec
-    pipe.dit.requires_grad_(False)
-    wav2vec.requires_grad_(False)
-    emotion2vec.requires_grad_(False)
-    # Unfreeze ONLY FantasyTalking params
-    fantasytalking.requires_grad_(True)
-    # Unfreeze audio processors injected into Wan DiT
-    for module in pipe.dit.modules():
-        if hasattr(module, "get_processor"):
-            processor = module.get_processor()
-            if processor.__class__.__name__ == "WanCrossAttentionProcessor":
-                for p in processor.parameters():
-                    p.requires_grad_(True)
+        wav_feat = extract_wav2vec_feature(self.wav2vec, self.wav2vec_processor, sample["audio_path"])
+        emo_feat = extract_emotion2vec_feature(self.emotion2vec, self.emotion_normalize, sample["audio_path"])
+        audio_proj = self.fantasytalking.get_proj_fea(wav_feat.to(dtype=torch.bfloat16), branch="frame")
+        audio_proj_global = self.fantasytalking.get_proj_fea(emo_feat.to(dtype=torch.bfloat16), branch="global")
 
-
-def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize):
-    os.makedirs(args.output_dir, exist_ok=True)
-    accelerator = accelerate.Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-    )
-    freeze_models(pipe, wav2vec, emotion2vec, fantasytalking)
-
-    processor_params = []
-    for module in pipe.dit.modules():
-        if hasattr(module, "get_processor"):
-            processor = module.get_processor()
-            if processor.__class__.__name__ == "WanCrossAttentionProcessor":
-                processor_params.extend([p for p in processor.parameters() if p.requires_grad])
-    trainable_params = [p for p in fantasytalking.parameters() if p.requires_grad] + processor_params
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-
-    dataset = TensorSampleDataset(args.metadata_path)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    pipe.dit, fantasytalking, optimizer, dataloader = accelerator.prepare(
-        pipe.dit, fantasytalking, optimizer, dataloader
-    )
-
-    step = 0
-    for epoch in range(args.epochs):
-        for sample in dataloader:
-            # sample_inputs.pt 需包含如下字段:
-            # latents:[B,C,F,H,W], context:[B,L,C]
-            input_latents = sample["latents"].to("cuda", dtype=torch.bfloat16)
-            context = sample["context"].to("cuda", dtype=torch.bfloat16)
-            clip_feature = sample.get("clip_feature", None)
-            y = sample.get("y", None)
-            if clip_feature is not None:
-                clip_feature = clip_feature.to("cuda", dtype=torch.bfloat16)
-            if y is not None:
-                y = y.to("cuda", dtype=torch.bfloat16)
-
-            audio_path = sample["audio_path"]
-            wav_feat = extract_wav2vec_feature(wav2vec, wav2vec_processor, audio_path)
-            emo_feat = extract_emotion2vec_feature(emotion2vec, emotion_normalize, audio_path)
-
-            audio_proj = fantasytalking.get_proj_fea(wav_feat.to(dtype=torch.bfloat16), branch="frame")
-            audio_proj_global = fantasytalking.get_proj_fea(emo_feat.to(dtype=torch.bfloat16), branch="global")
-
-            def model_fn_audio(
-                dit,
-                latents=None,
-                timestep=None,
-                context=None,
-                clip_feature=None,
-                y=None,
-                use_gradient_checkpointing=False,
-                use_gradient_checkpointing_offload=False,
-                **kwargs,
-            ):
-                return dit(
-                    x=latents,
-                    timestep=timestep,
-                    context=context,
-                    clip_feature=clip_feature,
-                    y=y,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                    audio_proj=audio_proj,
-                    audio_proj_global=audio_proj_global,
-                    latents_num_frames=input_latents.shape[2],
-                    audio_scale=1.0,
-                    audio_frame_scale=1.0,
-                    audio_global_scale=1.0,
-                )
-
-            pipe.model_fn = model_fn_audio
-            loss = FlowMatchSFTLoss(
-                pipe,
-                input_latents=input_latents,
+        def model_fn_audio(
+            dit,
+            latents=None,
+            timestep=None,
+            context=None,
+            clip_feature=None,
+            y=None,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
+            **kwargs,
+        ):
+            return dit(
+                x=latents,
+                timestep=timestep,
                 context=context,
                 clip_feature=clip_feature,
                 y=y,
-                use_gradient_checkpointing=False,
-                use_gradient_checkpointing_offload=False,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                audio_proj=audio_proj,
+                audio_proj_global=audio_proj_global,
+                latents_num_frames=input_latents.shape[2],
+                audio_scale=1.0,
+                audio_frame_scale=1.0,
+                audio_global_scale=1.0,
             )
-            optimizer.zero_grad(set_to_none=True)
-            accelerator.backward(loss)
-            optimizer.step()
 
-            step += 1
-            if step % 10 == 0 and accelerator.is_main_process:
-                print(f"[epoch {epoch}] step={step}, loss={loss.item():.6f}")
-
-            if step % args.save_every == 0 and accelerator.is_main_process:
-                ckpt = build_fantasytalking_checkpoint(
-                    accelerator.unwrap_model(fantasytalking),
-                    accelerator.unwrap_model(pipe.dit),
-                )
-                save_path = os.path.join(args.output_dir, f"fantasytalking_step_{step}.pt")
-                torch.save(ckpt, save_path)
-                print(f"Saved: {save_path}")
-
-    # final save
-    if accelerator.is_main_process:
-        final_ckpt = build_fantasytalking_checkpoint(
-            accelerator.unwrap_model(fantasytalking),
-            accelerator.unwrap_model(pipe.dit),
+        self.pipe.model_fn = model_fn_audio
+        return FlowMatchSFTLoss(
+            self.pipe,
+            input_latents=input_latents,
+            context=context,
+            clip_feature=clip_feature,
+            y=y,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
         )
-        final_path = os.path.join(args.output_dir, "fantasytalking_final.pt")
-        torch.save(final_ckpt, final_path)
-        print(f"Training done. Final checkpoint: {final_path}")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize = load_models(args)
-    main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize)
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    dataset = TensorSampleDataset(args.metadata_path)
+    model = FantasyTalkingTrainingModule(args, device=accelerator.device)
+    model_logger = ModelLogger(args.output_dir)
+    launch_training_task(
+        accelerator,
+        dataset,
+        model,
+        model_logger,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        save_steps=args.save_every,
+        num_epochs=args.epochs,
+    )
