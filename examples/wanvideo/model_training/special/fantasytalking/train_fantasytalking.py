@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import librosa
 import soundfile as sf
 import fairseq
+import accelerate
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -106,6 +107,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=100)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     return parser.parse_args()
 
 
@@ -161,17 +164,37 @@ def freeze_models(pipe, wav2vec, emotion2vec, fantasytalking):
     emotion2vec.requires_grad_(False)
     # Unfreeze ONLY FantasyTalking params
     fantasytalking.requires_grad_(True)
+    # Unfreeze audio processors injected into Wan DiT
+    for module in pipe.dit.modules():
+        if hasattr(module, "get_processor"):
+            processor = module.get_processor()
+            if processor.__class__.__name__ == "WanCrossAttentionProcessor":
+                for p in processor.parameters():
+                    p.requires_grad_(True)
 
 
 def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize):
     os.makedirs(args.output_dir, exist_ok=True)
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+    )
     freeze_models(pipe, wav2vec, emotion2vec, fantasytalking)
 
-    trainable_params = [p for p in fantasytalking.parameters() if p.requires_grad]
+    processor_params = []
+    for module in pipe.dit.modules():
+        if hasattr(module, "get_processor"):
+            processor = module.get_processor()
+            if processor.__class__.__name__ == "WanCrossAttentionProcessor":
+                processor_params.extend([p for p in processor.parameters() if p.requires_grad])
+    trainable_params = [p for p in fantasytalking.parameters() if p.requires_grad] + processor_params
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     dataset = TensorSampleDataset(args.metadata_path)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    pipe.dit, fantasytalking, optimizer, dataloader = accelerator.prepare(
+        pipe.dit, fantasytalking, optimizer, dataloader
+    )
 
     step = 0
     for epoch in range(args.epochs):
@@ -212,24 +235,31 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
 
             loss = F.mse_loss(pred.float(), target.float())
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
 
             step += 1
-            if step % 10 == 0:
+            if step % 10 == 0 and accelerator.is_main_process:
                 print(f"[epoch {epoch}] step={step}, loss={loss.item():.6f}")
 
-            if step % args.save_every == 0:
-                ckpt = build_fantasytalking_checkpoint(fantasytalking, pipe.dit)
+            if step % args.save_every == 0 and accelerator.is_main_process:
+                ckpt = build_fantasytalking_checkpoint(
+                    accelerator.unwrap_model(fantasytalking),
+                    accelerator.unwrap_model(pipe.dit),
+                )
                 save_path = os.path.join(args.output_dir, f"fantasytalking_step_{step}.pt")
                 torch.save(ckpt, save_path)
                 print(f"Saved: {save_path}")
 
     # final save
-    final_ckpt = build_fantasytalking_checkpoint(fantasytalking, pipe.dit)
-    final_path = os.path.join(args.output_dir, "fantasytalking_final.pt")
-    torch.save(final_ckpt, final_path)
-    print(f"Training done. Final checkpoint: {final_path}")
+    if accelerator.is_main_process:
+        final_ckpt = build_fantasytalking_checkpoint(
+            accelerator.unwrap_model(fantasytalking),
+            accelerator.unwrap_model(pipe.dit),
+        )
+        final_path = os.path.join(args.output_dir, "fantasytalking_final.pt")
+        torch.save(final_ckpt, final_path)
+        print(f"Training done. Final checkpoint: {final_path}")
 
 
 if __name__ == "__main__":
