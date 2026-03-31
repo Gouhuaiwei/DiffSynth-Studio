@@ -112,6 +112,11 @@ def parse_args():
     parser.add_argument("--use_lora", action="store_true", help="Train audio processor with LoRA adapters only.")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=8)
+    parser.add_argument(
+        "--lora_freeze_base_processor",
+        action="store_true",
+        help="Freeze base WanCrossAttentionProcessor weights when enabling LoRA.",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +194,7 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
             pipe.dit,
             rank=args.lora_rank,
             alpha=args.lora_alpha,
+            freeze_base=args.lora_freeze_base_processor,
         )
 
     processor_params = []

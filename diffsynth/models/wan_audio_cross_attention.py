@@ -166,7 +166,13 @@ class FantasyTalkingAudioConditionModel(nn.Module):
             )
         wan_dit.set_attn_processor(attn_procs)
 
-    def enable_audio_processor_lora(self, wan_dit: WanModel, rank: int = 8, alpha: Optional[int] = None):
+    def enable_audio_processor_lora(
+        self,
+        wan_dit: WanModel,
+        rank: int = 8,
+        alpha: Optional[int] = None,
+        freeze_base: bool = False,
+    ):
         try:
             from peft import LoraConfig, inject_adapter_in_model
         except ImportError as e:
@@ -181,11 +187,12 @@ class FantasyTalkingAudioConditionModel(nn.Module):
 
         for module in wan_dit.modules():
             if isinstance(module, WanCrossAttentionProcessor):
-                for p in module.parameters():
-                    p.requires_grad_(False)
+                if freeze_base:
+                    for p in module.parameters():
+                        p.requires_grad_(False)
                 inject_adapter_in_model(lora_config, module)
 
-        return {"rank": rank, "alpha": lora_alpha}
+        return {"rank": rank, "alpha": lora_alpha, "freeze_base": freeze_base}
 
     def load_audio_processor(self, ip_ckpt: str, wan_dit: WanModel):
         if os.path.splitext(ip_ckpt)[-1] == ".safetensors":
@@ -221,6 +228,7 @@ class FantasyTalkingAudioConditionModel(nn.Module):
                 wan_dit,
                 rank=int(lora_config.get("rank", 8)),
                 alpha=int(lora_config.get("alpha", lora_config.get("rank", 8))),
+                freeze_base=bool(lora_config.get("freeze_base", False)),
             )
 
         if "audio_processor" in state_dict:
