@@ -109,6 +109,9 @@ def parse_args():
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--use_lora", action="store_true", help="Train audio processor with LoRA adapters only.")
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=8)
     return parser.parse_args()
 
 
@@ -180,6 +183,13 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
         mixed_precision=args.mixed_precision,
     )
     freeze_models(pipe, wav2vec, emotion2vec, fantasytalking)
+    lora_config = None
+    if args.use_lora:
+        lora_config = fantasytalking.enable_audio_processor_lora(
+            pipe.dit,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+        )
 
     processor_params = []
     for module in pipe.dit.modules():
@@ -247,6 +257,8 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
                     accelerator.unwrap_model(fantasytalking),
                     accelerator.unwrap_model(pipe.dit),
                 )
+                if lora_config is not None:
+                    ckpt["audio_processor_lora_config"] = lora_config
                 save_path = os.path.join(args.output_dir, f"fantasytalking_step_{step}.pt")
                 torch.save(ckpt, save_path)
                 print(f"Saved: {save_path}")
@@ -257,6 +269,8 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
             accelerator.unwrap_model(fantasytalking),
             accelerator.unwrap_model(pipe.dit),
         )
+        if lora_config is not None:
+            final_ckpt["audio_processor_lora_config"] = lora_config
         final_path = os.path.join(args.output_dir, "fantasytalking_final.pt")
         torch.save(final_ckpt, final_path)
         print(f"Training done. Final checkpoint: {final_path}")

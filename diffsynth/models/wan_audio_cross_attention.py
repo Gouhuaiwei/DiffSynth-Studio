@@ -166,6 +166,27 @@ class FantasyTalkingAudioConditionModel(nn.Module):
             )
         wan_dit.set_attn_processor(attn_procs)
 
+    def enable_audio_processor_lora(self, wan_dit: WanModel, rank: int = 8, alpha: Optional[int] = None):
+        try:
+            from peft import LoraConfig, inject_adapter_in_model
+        except ImportError as e:
+            raise ImportError("LoRA training requires `peft` to be installed.") from e
+
+        lora_alpha = rank if alpha is None else alpha
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=lora_alpha,
+            target_modules=["k_proj_frame", "v_proj_frame", "k_proj_global", "v_proj_global"],
+        )
+
+        for module in wan_dit.modules():
+            if isinstance(module, WanCrossAttentionProcessor):
+                for p in module.parameters():
+                    p.requires_grad_(False)
+                inject_adapter_in_model(lora_config, module)
+
+        return {"rank": rank, "alpha": lora_alpha}
+
     def load_audio_processor(self, ip_ckpt: str, wan_dit: WanModel):
         if os.path.splitext(ip_ckpt)[-1] == ".safetensors":
             state_dict = {
@@ -193,6 +214,14 @@ class FantasyTalkingAudioConditionModel(nn.Module):
             self.proj_model_global.load_state_dict(state_dict["proj_model_global"], strict=True)
         if "proj_model" in state_dict and len(state_dict["proj_model"]) > 0:
             self.proj_model_frame.load_state_dict(state_dict["proj_model"], strict=True)
+
+        lora_config = state_dict.get("audio_processor_lora_config", None)
+        if lora_config is not None:
+            self.enable_audio_processor_lora(
+                wan_dit,
+                rank=int(lora_config.get("rank", 8)),
+                alpha=int(lora_config.get("alpha", lora_config.get("rank", 8))),
+            )
 
         if "audio_processor" in state_dict:
             wan_dit.load_state_dict(state_dict["audio_processor"], strict=False)
