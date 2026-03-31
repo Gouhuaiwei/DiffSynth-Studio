@@ -109,11 +109,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # 1) load Wan pipeline
+def load_models(args):
+    # 1) Load Wan pipeline
     model_manager = ModelManager(device="cpu")
     model_manager.load_models(
         [
@@ -134,7 +131,7 @@ def main():
     )
     pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
 
-    # 2) install FantasyTalking adapter
+    # 2) Install FantasyTalking adapter
     fantasytalking = FantasyTalkingAudioConditionModel(
         pipe.dit,
         audio_in_dim=args.audio_in_dim,
@@ -142,7 +139,7 @@ def main():
         global_audio_in_dim=args.global_audio_in_dim,
     ).to("cuda")
 
-    # 3) load audio encoders
+    # 3) Load audio encoders
     wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
     wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).to("cuda", dtype=torch.bfloat16).eval()
 
@@ -154,14 +151,21 @@ def main():
     models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([args.emotion2vec_ckpt])
     emotion2vec = models[0].eval().cuda()
     emotion_normalize = bool(task.cfg.normalize)
+    return pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize
 
-    # 4) freeze Wan + wav2vec + emotion2vec
+
+def freeze_models(pipe, wav2vec, emotion2vec, fantasytalking):
+    # Freeze Wan + wav2vec + emotion2vec
     pipe.dit.requires_grad_(False)
     wav2vec.requires_grad_(False)
     emotion2vec.requires_grad_(False)
-
-    # 5) unfreeze ONLY FantasyTalking params
+    # Unfreeze ONLY FantasyTalking params
     fantasytalking.requires_grad_(True)
+
+
+def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize):
+    os.makedirs(args.output_dir, exist_ok=True)
+    freeze_models(pipe, wav2vec, emotion2vec, fantasytalking)
 
     trainable_params = [p for p in fantasytalking.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -229,4 +233,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize = load_models(args)
+    main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize)
