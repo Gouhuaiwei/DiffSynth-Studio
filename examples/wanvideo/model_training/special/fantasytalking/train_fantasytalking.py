@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from diffsynth import ModelManager, WanVideoPipeline
+from diffsynth.diffusion import FlowMatchSFTLoss
 from diffsynth.models.wan_audio_cross_attention import FantasyTalkingAudioConditionModel
 
 
@@ -20,7 +21,7 @@ class TensorSampleDataset(Dataset):
     """
     JSONL 每行一个样本，至少包含:
     {
-      "model_input": "/path/to/sample_inputs.pt",  # 必须包含 latents,timestep,context,target
+      "model_input": "/path/to/sample_inputs.pt",  # 必须包含 latents,context
       "audio_path": "/path/to/sample.wav"
     }
     可选: clip_feature, y
@@ -200,11 +201,9 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
     for epoch in range(args.epochs):
         for sample in dataloader:
             # sample_inputs.pt 需包含如下字段:
-            # latents:[B,C,F,H,W], timestep:[B], context:[B,L,C], target:[B,C,F,H,W]
-            latents = sample["latents"].to("cuda", dtype=torch.bfloat16)
-            timestep = sample["timestep"].to("cuda", dtype=torch.bfloat16)
+            # latents:[B,C,F,H,W], context:[B,L,C]
+            input_latents = sample["latents"].to("cuda", dtype=torch.bfloat16)
             context = sample["context"].to("cuda", dtype=torch.bfloat16)
-            target = sample["target"].to("cuda", dtype=torch.bfloat16)
             clip_feature = sample.get("clip_feature", None)
             y = sample.get("y", None)
             if clip_feature is not None:
@@ -219,21 +218,43 @@ def main(args, pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, em
             audio_proj = fantasytalking.get_proj_fea(wav_feat.to(dtype=torch.bfloat16), branch="frame")
             audio_proj_global = fantasytalking.get_proj_fea(emo_feat.to(dtype=torch.bfloat16), branch="global")
 
-            pred = pipe.dit(
-                x=latents,
-                timestep=timestep,
+            def model_fn_audio(
+                dit,
+                latents=None,
+                timestep=None,
+                context=None,
+                clip_feature=None,
+                y=None,
+                use_gradient_checkpointing=False,
+                use_gradient_checkpointing_offload=False,
+                **kwargs,
+            ):
+                return dit(
+                    x=latents,
+                    timestep=timestep,
+                    context=context,
+                    clip_feature=clip_feature,
+                    y=y,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                    audio_proj=audio_proj,
+                    audio_proj_global=audio_proj_global,
+                    latents_num_frames=input_latents.shape[2],
+                    audio_scale=1.0,
+                    audio_frame_scale=1.0,
+                    audio_global_scale=1.0,
+                )
+
+            pipe.model_fn = model_fn_audio
+            loss = FlowMatchSFTLoss(
+                pipe,
+                input_latents=input_latents,
                 context=context,
                 clip_feature=clip_feature,
                 y=y,
-                audio_proj=audio_proj,
-                audio_proj_global=audio_proj_global,
-                latents_num_frames=latents.shape[2],
-                audio_scale=1.0,
-                audio_frame_scale=1.0,
-                audio_global_scale=1.0,
+                use_gradient_checkpointing=False,
+                use_gradient_checkpointing_offload=False,
             )
-
-            loss = F.mse_loss(pred.float(), target.float())
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)
             optimizer.step()
