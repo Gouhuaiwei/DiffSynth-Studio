@@ -1,88 +1,21 @@
-import argparse
-import json
-import os
-from dataclasses import dataclass
-
-import librosa
-import soundfile as sf
-import fairseq
-import accelerate
+import os, argparse, accelerate, warnings
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+import fairseq
+from dataclasses import dataclass
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
-from diffsynth import ModelManager, WanVideoPipeline
-from diffsynth.core.data.operators import LoadVideo, ImageCropAndResize
-from diffsynth.diffusion import DiffusionTrainingModule, FlowMatchSFTLoss, ModelLogger, launch_training_task
+from diffsynth.core import UnifiedDataset
+from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
+from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.diffusion import *
 from diffsynth.models.wan_audio_cross_attention import FantasyTalkingAudioConditionModel
 
-
-class TensorSampleDataset(Dataset):
-    """
-    JSONL 每行一个样本，至少包含:
-    {
-      "video_path": "/path/to/sample.mp4",
-      "audio_path": "/path/to/sample.wav"
-      "prompt": "a person talking"
-    }
-    """
-
-    def __init__(self, metadata_path: str, num_frames: int, height: int, width: int):
-        self.items = []
-        self.load_from_cache = False
-        self.video_loader = LoadVideo(
-            num_frames=num_frames,
-            time_division_factor=4,
-            time_division_remainder=1,
-            frame_processor=ImageCropAndResize(height, width, None, 16, 16),
-        )
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    self.items.append(json.loads(line))
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        item = self.items[idx]
-        prompt = item.get("prompt", item.get("text", ""))
-        video = self.video_loader(item["video_path"])
-        return {"prompt": prompt, "video": video, "audio_path": item["audio_path"]}
-
-def extract_wav2vec_feature(wav2vec, wav2vec_processor, audio_path: str):
-    audio, sr = librosa.load(audio_path, sr=16000, mono=True)
-    inputs = wav2vec_processor(audio, sampling_rate=sr, return_tensors="pt", padding=True).input_values
-    inputs = inputs.to(next(wav2vec.parameters()).device)
-    with torch.no_grad():
-        out = wav2vec(inputs)
-    return out.last_hidden_state
-
-
-def extract_emotion2vec_feature(emotion_model, normalize: bool, audio_path: str):
-    wav, sr = sf.read(audio_path)
-    channels = sf.info(audio_path).channels
-    assert sr == 16000, f"Sample rate should be 16kHz, got {sr}"
-    assert channels == 1, f"Channel should be 1, got {channels}"
-
-    with torch.no_grad():
-        source = torch.from_numpy(wav).float().cuda()
-        if normalize:
-            source = F.layer_norm(source, source.shape)
-        source = source.view(1, -1)
-        feats = emotion_model.extract_features(source, padding_mask=None)
-    return feats["x"]
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def build_fantasytalking_checkpoint(fantasytalking: FantasyTalkingAudioConditionModel, wan_dit: torch.nn.Module):
-    # 仅保存 FantasyTalking 相关参数
-    audio_processor_sd = {
-        k: v.cpu()
-        for k, v in wan_dit.state_dict().items()
-        if ".processor." in k
-    }
+    audio_processor_sd = {k: v.cpu() for k, v in wan_dit.state_dict().items() if ".processor." in k}
     return {
         "proj_model_frame": fantasytalking.proj_model_frame.state_dict(),
         "proj_model_global": fantasytalking.proj_model_global.state_dict(),
@@ -90,81 +23,73 @@ def build_fantasytalking_checkpoint(fantasytalking: FantasyTalkingAudioCondition
     }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser("Train FantasyTalking adapter (freeze Wan + audio encoders)")
-    parser.add_argument("--wan_model_dir", type=str, required=True)
-    parser.add_argument("--metadata_path", type=str, required=True, help="JSONL path for training samples")
-    parser.add_argument("--output_dir", type=str, required=True)
-
-    parser.add_argument("--wav2vec_model_dir", type=str, default="facebook/wav2vec2-base-960h")
-    parser.add_argument("--emotion2vec_user_dir", type=str, required=True)
-    parser.add_argument("--emotion2vec_ckpt", type=str, required=True)
-
-    parser.add_argument("--audio_in_dim", type=int, default=768)
-    parser.add_argument("--global_audio_in_dim", type=int, default=768)
-    parser.add_argument("--audio_proj_dim", type=int, default=2048)
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--num_frames", type=int, default=81)
-
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--save_every", type=int, default=100)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
-    return parser.parse_args()
-
-
-class FantasyTalkingTrainingModule(DiffusionTrainingModule):
-    def __init__(self, args, device):
+class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
+    def __init__(
+        self,
+        wan_model_dir=None,
+        wav2vec_model_dir="facebook/wav2vec2-base-960h",
+        emotion2vec_user_dir=None,
+        emotion2vec_ckpt=None,
+        audio_in_dim=768,
+        global_audio_in_dim=768,
+        audio_proj_dim=2048,
+        trainable_models=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        preset_lora_path=None, preset_lora_model=None,
+        use_gradient_checkpointing=True,
+        use_gradient_checkpointing_offload=False,
+        extra_inputs=None,
+        fp8_models=None,
+        offload_models=None,
+        device="cpu",
+        task="sft",
+        max_timestep_boundary=1.0,
+        min_timestep_boundary=0.0,
+    ):
         super().__init__()
-        self.args = args
-        self.device = device
-        self.pipe, self.fantasytalking, self.wav2vec_processor, self.wav2vec, self.emotion2vec, self.emotion_normalize = self.load_models()
-        self.freeze_models()
+        if not use_gradient_checkpointing:
+            warnings.warn("Gradient checkpointing is detected as disabled. To prevent out-of-memory errors, the training framework will forcibly enable gradient checkpointing.")
+            use_gradient_checkpointing = True
 
-    def load_models(self):
-        model_manager = ModelManager(device="cpu")
-        model_manager.load_models(
-            [
-                [
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00001-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00002-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00003-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00004-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00005-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00006-of-00007.safetensors",
-                    f"{self.args.wan_model_dir}/diffusion_pytorch_model-00007-of-00007.safetensors",
-                ],
-                f"{self.args.wan_model_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-                f"{self.args.wan_model_dir}/models_t5_umt5-xxl-enc-bf16.pth",
-                f"{self.args.wan_model_dir}/Wan2.1_VAE.pth",
-            ],
-            torch_dtype=torch.bfloat16,
+        model_configs = [
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00001-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00002-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00003-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00004-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00005-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00006-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/diffusion_pytorch_model-00007-of-00007.safetensors"),
+            ModelConfig(path=f"{wan_model_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+            ModelConfig(path=f"{wan_model_dir}/models_t5_umt5-xxl-enc-bf16.pth"),
+            ModelConfig(path=f"{wan_model_dir}/Wan2.1_VAE.pth"),
+        ]
+        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs)
+        self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
+        self.switch_pipe_to_training_mode(
+            self.pipe, trainable_models,
+            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
+            preset_lora_path, preset_lora_model,
+            task=task,
         )
-        pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device=self.device)
-        fantasytalking = FantasyTalkingAudioConditionModel(
-            pipe.dit,
-            audio_in_dim=self.args.audio_in_dim,
-            audio_proj_dim=self.args.audio_proj_dim,
-            global_audio_in_dim=self.args.global_audio_in_dim,
-        ).to(self.device)
-        wav2vec_processor = Wav2Vec2Processor.from_pretrained(self.args.wav2vec_model_dir)
-        wav2vec = Wav2Vec2Model.from_pretrained(self.args.wav2vec_model_dir).to(self.device, dtype=torch.bfloat16).eval()
+
+        self.fantasytalking = FantasyTalkingAudioConditionModel(
+            self.pipe.dit,
+            audio_in_dim=audio_in_dim,
+            audio_proj_dim=audio_proj_dim,
+            global_audio_in_dim=global_audio_in_dim,
+        ).to(device)
+        self.wav2vec_processor = Wav2Vec2Processor.from_pretrained(wav2vec_model_dir)
+        self.wav2vec = Wav2Vec2Model.from_pretrained(wav2vec_model_dir).to(device, dtype=torch.bfloat16).eval()
 
         @dataclass
         class UserDirModule:
             user_dir: str
 
-        fairseq.utils.import_user_module(UserDirModule(self.args.emotion2vec_user_dir))
-        models, cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task([self.args.emotion2vec_ckpt])
-        emotion2vec = models[0].eval().to(self.device)
-        emotion_normalize = bool(task.cfg.normalize)
-        return pipe, fantasytalking, wav2vec_processor, wav2vec, emotion2vec, emotion_normalize
+        fairseq.utils.import_user_module(UserDirModule(emotion2vec_user_dir))
+        models, cfg, task_emo = fairseq.checkpoint_utils.load_model_ensemble_and_task([emotion2vec_ckpt])
+        self.emotion2vec = models[0].eval().to(device)
+        self.emotion_normalize = bool(task_emo.cfg.normalize)
 
-    def freeze_models(self):
         self.pipe.dit.requires_grad_(False)
         self.wav2vec.requires_grad_(False)
         self.emotion2vec.requires_grad_(False)
@@ -176,82 +101,184 @@ class FantasyTalkingTrainingModule(DiffusionTrainingModule):
                     for p in processor.parameters():
                         p.requires_grad_(True)
 
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
+        self.fp8_models = fp8_models
+        self.task = task
+        self.task_to_loss = {
+            "sft:data_process": lambda pipe, *args: args,
+            "direct_distill:data_process": lambda pipe, *args: args,
+            "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+        }
+        self.max_timestep_boundary = max_timestep_boundary
+        self.min_timestep_boundary = min_timestep_boundary
+
+    def extract_wav2vec_feature(self, input_audio):
+        inputs = self.wav2vec_processor(input_audio, sampling_rate=16000, return_tensors="pt", padding=True).input_values
+        inputs = inputs.to(next(self.wav2vec.parameters()).device)
+        with torch.no_grad():
+            out = self.wav2vec(inputs)
+        return out.last_hidden_state
+
+    def extract_emotion2vec_feature(self, input_audio):
+        with torch.no_grad():
+            source = torch.from_numpy(input_audio).float().to(self.pipe.device)
+            if self.emotion_normalize:
+                source = F.layer_norm(source, source.shape)
+            source = source.view(1, -1)
+            feats = self.emotion2vec.extract_features(source, padding_mask=None)
+        return feats["x"]
+
+    def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
+        for extra_input in extra_inputs:
+            if extra_input == "input_image":
+                inputs_shared["input_image"] = data["video"][0]
+            elif extra_input == "end_image":
+                inputs_shared["end_image"] = data["video"][-1]
+            elif extra_input == "reference_image" or extra_input == "vace_reference_image":
+                inputs_shared[extra_input] = data[extra_input][0]
+            else:
+                inputs_shared[extra_input] = data[extra_input]
+        return inputs_shared
+
+    def get_pipeline_inputs(self, data):
+        inputs_posi = {"prompt": data["prompt"]}
+        inputs_nega = {}
+        inputs_shared = {
+            "input_video": data["video"],
+            "height": data["video"][0].size[1],
+            "width": data["video"][0].size[0],
+            "num_frames": len(data["video"]),
+            "cfg_scale": 1,
+            "tiled": False,
+            "rand_device": self.pipe.device,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "cfg_merge": False,
+            "vace_scale": 1,
+            "max_timestep_boundary": self.max_timestep_boundary,
+            "min_timestep_boundary": self.min_timestep_boundary,
+        }
+        inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        return inputs_shared, inputs_posi, inputs_nega
+
     def export_trainable_state_dict(self, state_dict, remove_prefix=None):
         return build_fantasytalking_checkpoint(self.fantasytalking, self.pipe.dit)
 
     def forward(self, data, inputs=None):
-        sample = data if inputs is None else inputs
-        prompt = sample["prompt"]
-        video = sample["video"]
-        self.pipe.load_models_to_device(["vae", "text_encoder"])
-        input_video = self.pipe.preprocess_video(video)
-        input_latents = self.pipe.vae.encode(input_video, device=self.pipe.device).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        ids, mask = self.pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.pipe.device)
-        mask = mask.to(self.pipe.device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.pipe.text_encoder(ids, mask)
-        for i, v in enumerate(seq_lens):
-            context[:, v:] = 0
+        if inputs is None:
+            inputs = self.get_pipeline_inputs(data)
+        inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
+        for unit in self.pipe.units:
+            inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
 
-        wav_feat = extract_wav2vec_feature(self.wav2vec, self.wav2vec_processor, sample["audio_path"])
-        emo_feat = extract_emotion2vec_feature(self.emotion2vec, self.emotion_normalize, sample["audio_path"])
+        inputs_shared, inputs_posi, inputs_nega = inputs
+        wav_feat = self.extract_wav2vec_feature(data["input_audio"])
+        emo_feat = self.extract_emotion2vec_feature(data["input_audio"])
         audio_proj = self.fantasytalking.get_proj_fea(wav_feat.to(dtype=torch.bfloat16), branch="frame")
         audio_proj_global = self.fantasytalking.get_proj_fea(emo_feat.to(dtype=torch.bfloat16), branch="global")
 
-        def model_fn_audio(
-            dit,
-            latents=None,
-            timestep=None,
-            context=None,
-            clip_feature=None,
-            y=None,
-            use_gradient_checkpointing=False,
-            use_gradient_checkpointing_offload=False,
-            **kwargs,
-        ):
-            return dit(
-                x=latents,
-                timestep=timestep,
-                context=context,
-                clip_feature=clip_feature,
-                y=y,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                audio_proj=audio_proj,
-                audio_proj_global=audio_proj_global,
-                latents_num_frames=input_latents.shape[2],
-                audio_scale=1.0,
-                audio_frame_scale=1.0,
-                audio_global_scale=1.0,
-            )
+        base_model_fn = self.pipe.model_fn
+
+        def model_fn_audio(*args, **kwargs):
+            kwargs["audio_proj"] = audio_proj
+            kwargs["audio_proj_global"] = audio_proj_global
+            kwargs["latents_num_frames"] = inputs_shared["input_latents"].shape[2]
+            kwargs["audio_scale"] = 1.0
+            kwargs["audio_frame_scale"] = 1.0
+            kwargs["audio_global_scale"] = 1.0
+            return base_model_fn(*args, **kwargs)
 
         self.pipe.model_fn = model_fn_audio
-        return FlowMatchSFTLoss(
-            self.pipe,
-            input_latents=input_latents,
-            context=context,
-            clip_feature=None,
-            y=None,
-            use_gradient_checkpointing=False,
-            use_gradient_checkpointing_offload=False,
-        )
+        loss = self.task_to_loss[self.task](self.pipe, inputs_shared, inputs_posi, inputs_nega)
+        self.pipe.model_fn = base_model_fn
+        return loss
+
+
+def wan_parser():
+    parser = argparse.ArgumentParser(description="FantasyTalking training with Wan-style runner.")
+    parser = add_general_config(parser)
+    parser = add_video_size_config(parser)
+    parser.add_argument("--wan_model_dir", type=str, required=True)
+    parser.add_argument("--wav2vec_model_dir", type=str, default="facebook/wav2vec2-base-960h")
+    parser.add_argument("--emotion2vec_user_dir", type=str, required=True)
+    parser.add_argument("--emotion2vec_ckpt", type=str, required=True)
+    parser.add_argument("--audio_in_dim", type=int, default=768)
+    parser.add_argument("--global_audio_in_dim", type=int, default=768)
+    parser.add_argument("--audio_proj_dim", type=int, default=2048)
+    parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
+    parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
+    parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true")
+    return parser
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    dataset = TensorSampleDataset(args.metadata_path, num_frames=args.num_frames, height=args.height, width=args.width)
-    model = FantasyTalkingTrainingModule(args, device=accelerator.device)
-    model_logger = ModelLogger(args.output_dir)
-    launch_training_task(
-        accelerator,
-        dataset,
-        model,
-        model_logger,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        save_steps=args.save_every,
-        num_epochs=args.epochs,
+    parser = wan_parser()
+    args = parser.parse_args()
+    accelerator = accelerate.Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+
+    dataset = UnifiedDataset(
+        base_path=args.dataset_base_path,
+        metadata_path=args.dataset_metadata_path,
+        repeat=args.dataset_repeat,
+        data_file_keys=args.data_file_keys.split(","),
+        main_data_operator=UnifiedDataset.default_video_operator(
+            base_path=args.dataset_base_path,
+            max_pixels=args.max_pixels,
+            height=args.height,
+            width=args.width,
+            height_division_factor=16,
+            width_division_factor=16,
+            num_frames=args.num_frames,
+            time_division_factor=4,
+            time_division_remainder=1,
+        ),
+        special_operator_map={
+            "video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(args.height, args.width, None, 16, 16)),
+            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+        }
+    )
+
+    model = WanFantasyTalkingTrainingModule(
+        wan_model_dir=args.wan_model_dir,
+        wav2vec_model_dir=args.wav2vec_model_dir,
+        emotion2vec_user_dir=args.emotion2vec_user_dir,
+        emotion2vec_ckpt=args.emotion2vec_ckpt,
+        audio_in_dim=args.audio_in_dim,
+        global_audio_in_dim=args.global_audio_in_dim,
+        audio_proj_dim=args.audio_proj_dim,
+        trainable_models=args.trainable_models,
+        lora_base_model=args.lora_base_model,
+        lora_target_modules=args.lora_target_modules,
+        lora_rank=args.lora_rank,
+        lora_checkpoint=args.lora_checkpoint,
+        preset_lora_path=args.preset_lora_path,
+        preset_lora_model=args.preset_lora_model,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
+        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        extra_inputs=args.extra_inputs,
+        fp8_models=args.fp8_models,
+        offload_models=args.offload_models,
+        task=args.task,
+        device="cpu" if args.initialize_model_on_cpu else accelerator.device,
+        max_timestep_boundary=args.max_timestep_boundary,
+        min_timestep_boundary=args.min_timestep_boundary,
+    )
+
+    model_logger = ModelLogger(args.output_path, remove_prefix_in_ckpt=args.remove_prefix_in_ckpt)
+    launcher_map = {
+        "sft:data_process": launch_data_process_task,
+        "direct_distill:data_process": launch_data_process_task,
+        "sft": launch_training_task,
+        "sft:train": launch_training_task,
+        "direct_distill": launch_training_task,
+        "direct_distill:train": launch_training_task,
+    }
+    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
