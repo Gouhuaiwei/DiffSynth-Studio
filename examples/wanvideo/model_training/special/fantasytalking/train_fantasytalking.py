@@ -195,6 +195,32 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
 
         self.pipe.model_fn = model_fn_audio
         loss = self.task_to_loss[self.task](self.pipe, inputs_shared, inputs_posi, inputs_nega)
+        if not loss.requires_grad:
+            max_timestep_boundary = int(inputs_shared.get("max_timestep_boundary", 1) * len(self.pipe.scheduler.timesteps))
+            min_timestep_boundary = int(inputs_shared.get("min_timestep_boundary", 0) * len(self.pipe.scheduler.timesteps))
+            timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+            timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+
+            noise = torch.randn_like(inputs_shared["input_latents"])
+            latents = self.pipe.scheduler.add_noise(inputs_shared["input_latents"], noise, timestep)
+            target = self.pipe.scheduler.training_target(inputs_shared["input_latents"], noise, timestep)
+
+            pred = self.pipe.dit(
+                x=latents,
+                timestep=timestep,
+                context=inputs_shared["context"],
+                clip_feature=inputs_shared.get("clip_feature", None),
+                y=inputs_shared.get("y", None),
+                use_gradient_checkpointing=inputs_shared.get("use_gradient_checkpointing", False),
+                use_gradient_checkpointing_offload=inputs_shared.get("use_gradient_checkpointing_offload", False),
+                audio_proj=audio_proj,
+                audio_proj_global=audio_proj_global,
+                latents_num_frames=inputs_shared["input_latents"].shape[2],
+                audio_scale=1.0,
+                audio_frame_scale=1.0,
+                audio_global_scale=1.0,
+            )
+            loss = torch.nn.functional.mse_loss(pred.float(), target.float()) * self.pipe.scheduler.training_weight(timestep)
         self.pipe.model_fn = base_model_fn
         return loss
 
