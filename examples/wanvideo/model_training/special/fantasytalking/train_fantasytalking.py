@@ -48,6 +48,7 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        log_every=10,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -120,6 +121,8 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+        self.log_every = log_every
+        self.global_step = 0
 
     def extract_wav2vec_feature(self, input_audio):
         inputs = self.wav2vec_processor(input_audio, sampling_rate=16000, return_tensors="pt", padding=True).input_values
@@ -231,6 +234,11 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
             # 当外部训练配置导致 loss 图被截断时，增加极小正则项保证图可回传到 FantasyTalking 参数。
             loss = loss + 1e-8 * (audio_proj.float().pow(2).mean() + audio_proj_global.float().pow(2).mean())
         self.pipe.model_fn = base_model_fn
+        self.global_step += 1
+        if self.global_step % self.log_every == 0:
+            is_main = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            if is_main:
+                print(f"[FantasyTalking][step {self.global_step}] loss={loss.detach().float().item():.6f}")
         return loss
 
 
@@ -247,6 +255,7 @@ def wan_parser():
     parser.add_argument("--audio_proj_dim", type=int, default=2048)
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
+    parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true")
     return parser
 
@@ -305,6 +314,7 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        log_every=args.log_every,
     )
 
     model_logger = ModelLogger(args.output_path, remove_prefix_in_ckpt=args.remove_prefix_in_ckpt)
