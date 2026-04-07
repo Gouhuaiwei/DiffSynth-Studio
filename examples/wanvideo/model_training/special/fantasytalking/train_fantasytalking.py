@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import fairseq
 from dataclasses import dataclass
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
+from safetensors import safe_open
 
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
@@ -49,6 +50,7 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
         log_every=10,
+        resume_from_checkpoint=None,
     ):
         super().__init__()
         if not use_gradient_checkpointing:
@@ -93,6 +95,8 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         models, cfg, task_emo = fairseq.checkpoint_utils.load_model_ensemble_and_task([emotion2vec_ckpt])
         self.emotion2vec = models[0].eval().to(device)
         self.emotion_normalize = bool(task_emo.cfg.normalize)
+        if resume_from_checkpoint is not None and os.path.isfile(resume_from_checkpoint):
+            self.load_fantasytalking_checkpoint(resume_from_checkpoint)
 
         self.pipe.dit.requires_grad_(False)
         self.wav2vec.requires_grad_(False)
@@ -123,6 +127,27 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         self.min_timestep_boundary = min_timestep_boundary
         self.log_every = log_every
         self.global_step = 0
+
+    def load_fantasytalking_checkpoint(self, checkpoint_path: str):
+        if checkpoint_path.endswith(".safetensors"):
+            state_dict = {}
+            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+        else:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+
+        frame_sd = {k[len("proj_model_frame."):]: v for k, v in state_dict.items() if k.startswith("proj_model_frame.")}
+        global_sd = {k[len("proj_model_global."):]: v for k, v in state_dict.items() if k.startswith("proj_model_global.")}
+        proc_sd = {k[len("audio_processor."):]: v for k, v in state_dict.items() if k.startswith("audio_processor.")}
+
+        if len(frame_sd) > 0:
+            self.fantasytalking.proj_model_frame.load_state_dict(frame_sd, strict=False)
+        if len(global_sd) > 0:
+            self.fantasytalking.proj_model_global.load_state_dict(global_sd, strict=False)
+        if len(proc_sd) > 0:
+            self.pipe.dit.load_state_dict(proc_sd, strict=False)
+        print(f"Loaded FantasyTalking checkpoint: {checkpoint_path}")
 
     def extract_wav2vec_feature(self, input_audio):
         inputs = self.wav2vec_processor(input_audio, sampling_rate=16000, return_tensors="pt", padding=True).input_values
@@ -256,6 +281,7 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true")
     return parser
 
@@ -315,6 +341,7 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
         log_every=args.log_every,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
 
     model_logger = ModelLogger(args.output_path, remove_prefix_in_ckpt=args.remove_prefix_in_ckpt)

@@ -13,6 +13,8 @@ OUTPUT_PATH="./models/fantasytalking_exp01"
 # emotion2vec（fairseq）配置
 EMOTION2VEC_USER_DIR="/path/to/emotion2vec/upstream"
 EMOTION2VEC_CKPT="/path/to/emotion2vec_base.pt"
+# 可选：从已有 checkpoint 继续训练（safetensors 或 pt）
+# RESUME_CKPT="/path/to/step-1000.safetensors"
 
 # 可选：多卡训练
 # export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -42,5 +44,8 @@ python examples/wanvideo/model_training/special/fantasytalking/train_fantasytalk
   --max_pixels 1048576 \
   --use_gradient_checkpointing \
   --remove_prefix_in_ckpt ""
+
+# 如果要继续训练，去掉下面这行注释并运行：
+#   --resume_from_checkpoint "${RESUME_CKPT}" \
 
 echo "Done. Checkpoints are saved to: ${OUTPUT_PATH}"
