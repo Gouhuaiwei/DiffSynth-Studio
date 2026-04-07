@@ -47,6 +47,14 @@ class WanCrossAttentionProcessor(nn.Module):
         nn.init.zeros_(self.k_proj_global.weight)
         nn.init.zeros_(self.v_proj_global.weight)
 
+    @staticmethod
+    def _align_qkv_dtype_device(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        if k.dtype != q.dtype or k.device != q.device:
+            k = k.to(dtype=q.dtype, device=q.device)
+        if v.dtype != q.dtype or v.device != q.device:
+            v = v.to(dtype=q.dtype, device=q.device)
+        return q, k, v
+
     def __call__(
         self,
         attn: nn.Module,
@@ -79,6 +87,7 @@ class WanCrossAttentionProcessor(nn.Module):
         q = attn.norm_q(attn.q(x))
         k = attn.norm_k(attn.k(context_txt))
         v = attn.v(context_txt)
+        q, k, v = self._align_qkv_dtype_device(q, k, v)
 
         x_txt = attn.attn(q, k, v)
         x_base = x_txt
@@ -86,7 +95,8 @@ class WanCrossAttentionProcessor(nn.Module):
         if context_img is not None:
             k_img = attn.norm_k_img(attn.k_img(context_img))
             v_img = attn.v_img(context_img)
-            x_img = flash_attention(q, k_img, v_img, num_heads=attn.num_heads)
+            q_img, k_img, v_img = self._align_qkv_dtype_device(q, k_img, v_img)
+            x_img = flash_attention(q_img, k_img, v_img, num_heads=attn.num_heads)
             x_base = x_base + x_img
 
         audio_residual = 0
@@ -128,8 +138,7 @@ class WanCrossAttentionProcessor(nn.Module):
             audio_q = q.view(b, t, tokens_per_frame, -1).reshape(b * t, tokens_per_frame, -1)
             audio_k = self.k_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
             audio_v = self.v_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
-            audio_k = audio_k.to(dtype=audio_q.dtype, device=audio_q.device)
-            audio_v = audio_v.to(dtype=audio_q.dtype, device=audio_q.device)
+            audio_q, audio_k, audio_v = self._align_qkv_dtype_device(audio_q, audio_k, audio_v)
             audio_x = flash_attention(audio_q, audio_k, audio_v, num_heads=attn.num_heads)
             audio_x = audio_x.view(b, t, tokens_per_frame, -1).reshape(b, q.size(1), -1)
             audio_residual = audio_residual + audio_x * audio_frame_scale
@@ -147,9 +156,8 @@ class WanCrossAttentionProcessor(nn.Module):
             )
             global_k = self.k_proj_global(audio_proj_global)
             global_v = self.v_proj_global(audio_proj_global)
-            global_k = global_k.to(dtype=q.dtype, device=q.device)
-            global_v = global_v.to(dtype=q.dtype, device=q.device)
-            global_x = flash_attention(q, global_k, global_v, num_heads=attn.num_heads)
+            q_global, global_k, global_v = self._align_qkv_dtype_device(q, global_k, global_v)
+            global_x = flash_attention(q_global, global_k, global_v, num_heads=attn.num_heads)
             audio_residual = audio_residual + global_x * audio_global_scale
 
         out = x_base + audio_residual * audio_scale
