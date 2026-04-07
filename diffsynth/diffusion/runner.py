@@ -31,7 +31,10 @@ def launch_training_task(
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        epoch_loss_sum = 0.0
+        epoch_steps = 0
+        progress_bar = tqdm(dataloader, disable=not accelerator.is_main_process)
+        for data in progress_bar:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -42,6 +45,16 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
                 scheduler.step()
+                epoch_loss_sum += loss.detach().float().item()
+                epoch_steps += 1
+                if accelerator.is_main_process:
+                    progress_bar.set_postfix(
+                        loss=f"{loss.detach().float().item():.6f}",
+                        avg=f"{(epoch_loss_sum / max(epoch_steps, 1)):.6f}",
+                    )
+        if accelerator.is_main_process and epoch_steps > 0:
+            epoch_loss_avg = epoch_loss_sum / epoch_steps
+            print(f"[Epoch {epoch_id}] avg_loss={epoch_loss_avg:.6f}")
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
