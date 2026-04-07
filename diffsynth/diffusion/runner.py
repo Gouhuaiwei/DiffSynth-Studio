@@ -33,7 +33,8 @@ def launch_training_task(
     for epoch_id in range(num_epochs):
         epoch_loss_sum = 0.0
         epoch_steps = 0
-        for data in tqdm(dataloader):
+        progress_bar = tqdm(dataloader, disable=not accelerator.is_main_process)
+        for data in progress_bar:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -46,6 +47,11 @@ def launch_training_task(
                 scheduler.step()
                 epoch_loss_sum += loss.detach().float().item()
                 epoch_steps += 1
+                if accelerator.is_main_process:
+                    progress_bar.set_postfix(
+                        loss=f"{loss.detach().float().item():.6f}",
+                        avg=f"{(epoch_loss_sum / max(epoch_steps, 1)):.6f}",
+                    )
         if accelerator.is_main_process and epoch_steps > 0:
             epoch_loss_avg = epoch_loss_sum / epoch_steps
             print(f"[Epoch {epoch_id}] avg_loss={epoch_loss_avg:.6f}")
