@@ -120,7 +120,8 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
 
     def extract_wav2vec_feature(self, input_audio):
         inputs = self.wav2vec_processor(input_audio, sampling_rate=16000, return_tensors="pt", padding=True).input_values
-        inputs = inputs.to(next(self.wav2vec.parameters()).device)
+        wav2vec_param = next(self.wav2vec.parameters())
+        inputs = inputs.to(device=wav2vec_param.device, dtype=wav2vec_param.dtype)
         with torch.no_grad():
             out = self.wav2vec(inputs)
         return out.last_hidden_state
