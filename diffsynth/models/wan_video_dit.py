@@ -27,6 +27,10 @@ except ModuleNotFoundError:
     
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+    if k.dtype != q.dtype or k.device != q.device:
+        k = k.to(dtype=q.dtype, device=q.device)
+    if v.dtype != q.dtype or v.device != q.device:
+        v = v.to(dtype=q.dtype, device=q.device)
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
