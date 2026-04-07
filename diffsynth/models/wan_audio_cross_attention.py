@@ -66,7 +66,7 @@ class WanCrossAttentionProcessor(nn.Module):
         audio_proj:       帧对齐音频，[B, T, La, C] 或 [B, T, C]
         audio_proj_global:全局音频，[B, Lg, C] 或 [B, T, Lg, C]
         """
-        b, n, d = x.size(0), attn.num_heads, attn.head_dim
+        b = x.size(0)
 
         # ---- 原始 I2V cross-attn ----
         if attn.has_image_input:
@@ -76,17 +76,17 @@ class WanCrossAttentionProcessor(nn.Module):
             context_img = None
             context_txt = context
 
-        q = attn.norm_q(attn.q(x)).view(b, -1, n, d)
-        k = attn.norm_k(attn.k(context_txt)).view(b, -1, n, d)
-        v = attn.v(context_txt).view(b, -1, n, d)
+        q = attn.norm_q(attn.q(x))
+        k = attn.norm_k(attn.k(context_txt))
+        v = attn.v(context_txt)
 
-        x_txt = flash_attention(q, k, v, num_heads=attn.num_heads).flatten(2)
+        x_txt = attn.attn(q, k, v)
         x_base = x_txt
 
         if context_img is not None:
-            k_img = attn.norm_k_img(attn.k_img(context_img)).view(b, -1, n, d)
-            v_img = attn.v_img(context_img).view(b, -1, n, d)
-            x_img = flash_attention(q, k_img, v_img, num_heads=attn.num_heads).flatten(2)
+            k_img = attn.norm_k_img(attn.k_img(context_img))
+            v_img = attn.v_img(context_img)
+            x_img = flash_attention(q, k_img, v_img, num_heads=attn.num_heads)
             x_base = x_base + x_img
 
         audio_residual = 0
@@ -123,11 +123,12 @@ class WanCrossAttentionProcessor(nn.Module):
             if q.shape[1] % t != 0:
                 raise ValueError(f"video tokens {q.shape[1]} cannot be evenly split by frames {t}")
 
-            audio_q = q.view(b * t, -1, n, d)
-            audio_k = self.k_proj_frame(audio_proj).view(b * t, -1, n, d)
-            audio_v = self.v_proj_frame(audio_proj).view(b * t, -1, n, d)
+            tokens_per_frame = q.shape[1] // t
+            audio_q = q.view(b, t, tokens_per_frame, -1).reshape(b * t, tokens_per_frame, -1)
+            audio_k = self.k_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
+            audio_v = self.v_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
             audio_x = flash_attention(audio_q, audio_k, audio_v, num_heads=attn.num_heads)
-            audio_x = audio_x.view(b, q.size(1), n, d).flatten(2)
+            audio_x = audio_x.view(b, t, tokens_per_frame, -1).reshape(b, q.size(1), -1)
             audio_residual = audio_residual + audio_x * audio_frame_scale
 
         # ---- 全局分支（emotion2vec）----
@@ -137,9 +138,9 @@ class WanCrossAttentionProcessor(nn.Module):
             if audio_proj_global.dim() != 3:
                 raise ValueError(f"audio_proj_global must be [B,L,C] or [B,T,L,C], got {tuple(audio_proj_global.shape)}")
 
-            global_k = self.k_proj_global(audio_proj_global).view(b, -1, n, d)
-            global_v = self.v_proj_global(audio_proj_global).view(b, -1, n, d)
-            global_x = flash_attention(q, global_k, global_v, num_heads=attn.num_heads).flatten(2)
+            global_k = self.k_proj_global(audio_proj_global)
+            global_v = self.v_proj_global(audio_proj_global)
+            global_x = flash_attention(q, global_k, global_v, num_heads=attn.num_heads)
             audio_residual = audio_residual + global_x * audio_global_scale
 
         out = x_base + audio_residual * audio_scale
