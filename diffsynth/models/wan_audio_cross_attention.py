@@ -128,6 +128,8 @@ class WanCrossAttentionProcessor(nn.Module):
             audio_q = q.view(b, t, tokens_per_frame, -1).reshape(b * t, tokens_per_frame, -1)
             audio_k = self.k_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
             audio_v = self.v_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
+            audio_k = audio_k.to(dtype=audio_q.dtype, device=audio_q.device)
+            audio_v = audio_v.to(dtype=audio_q.dtype, device=audio_q.device)
             audio_x = flash_attention(audio_q, audio_k, audio_v, num_heads=attn.num_heads)
             audio_x = audio_x.view(b, t, tokens_per_frame, -1).reshape(b, q.size(1), -1)
             audio_residual = audio_residual + audio_x * audio_frame_scale
@@ -145,6 +147,8 @@ class WanCrossAttentionProcessor(nn.Module):
             )
             global_k = self.k_proj_global(audio_proj_global)
             global_v = self.v_proj_global(audio_proj_global)
+            global_k = global_k.to(dtype=q.dtype, device=q.device)
+            global_v = global_v.to(dtype=q.dtype, device=q.device)
             global_x = flash_attention(q, global_k, global_v, num_heads=attn.num_heads)
             audio_residual = audio_residual + global_x * audio_global_scale
 
