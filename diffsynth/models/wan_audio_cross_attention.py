@@ -123,6 +123,7 @@ class WanCrossAttentionProcessor(nn.Module):
             if q.shape[1] % t != 0:
                 raise ValueError(f"video tokens {q.shape[1]} cannot be evenly split by frames {t}")
 
+            audio_proj = audio_proj.to(dtype=self.k_proj_frame.weight.dtype, device=self.k_proj_frame.weight.device)
             tokens_per_frame = q.shape[1] // t
             audio_q = q.view(b, t, tokens_per_frame, -1).reshape(b * t, tokens_per_frame, -1)
             audio_k = self.k_proj_frame(audio_proj).reshape(b * t, -1, q.shape[-1])
@@ -138,6 +139,10 @@ class WanCrossAttentionProcessor(nn.Module):
             if audio_proj_global.dim() != 3:
                 raise ValueError(f"audio_proj_global must be [B,L,C] or [B,T,L,C], got {tuple(audio_proj_global.shape)}")
 
+            audio_proj_global = audio_proj_global.to(
+                dtype=self.k_proj_global.weight.dtype,
+                device=self.k_proj_global.weight.device,
+            )
             global_k = self.k_proj_global(audio_proj_global)
             global_v = self.v_proj_global(audio_proj_global)
             global_x = flash_attention(q, global_k, global_v, num_heads=attn.num_heads)
