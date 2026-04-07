@@ -15,12 +15,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def build_fantasytalking_checkpoint(fantasytalking: FantasyTalkingAudioConditionModel, wan_dit: torch.nn.Module):
-    audio_processor_sd = {k: v.cpu() for k, v in wan_dit.state_dict().items() if ".processor." in k}
-    return {
-        "proj_model_frame": fantasytalking.proj_model_frame.state_dict(),
-        "proj_model_global": fantasytalking.proj_model_global.state_dict(),
-        "audio_processor": audio_processor_sd,
-    }
+    state_dict = {}
+    for k, v in fantasytalking.proj_model_frame.state_dict().items():
+        state_dict[f"proj_model_frame.{k}"] = v.detach().cpu()
+    for k, v in fantasytalking.proj_model_global.state_dict().items():
+        state_dict[f"proj_model_global.{k}"] = v.detach().cpu()
+    for k, v in wan_dit.state_dict().items():
+        if ".processor." in k:
+            state_dict[f"audio_processor.{k}"] = v.detach().cpu()
+    return state_dict
 
 
 class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
