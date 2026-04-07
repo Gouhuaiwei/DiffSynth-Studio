@@ -77,7 +77,7 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
             audio_in_dim=audio_in_dim,
             audio_proj_dim=audio_proj_dim,
             global_audio_in_dim=global_audio_in_dim,
-        ).to(device)
+        ).to(device=device, dtype=torch.bfloat16)
         self.wav2vec_processor = Wav2Vec2Processor.from_pretrained(wav2vec_model_dir)
         self.wav2vec = Wav2Vec2Model.from_pretrained(wav2vec_model_dir).to(device, dtype=torch.bfloat16).eval()
 
@@ -98,6 +98,7 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
             if hasattr(module, "get_processor"):
                 processor = module.get_processor()
                 if processor.__class__.__name__ == "WanCrossAttentionProcessor":
+                    processor.to(device=device, dtype=torch.bfloat16)
                     for p in processor.parameters():
                         p.requires_grad_(True)
 
