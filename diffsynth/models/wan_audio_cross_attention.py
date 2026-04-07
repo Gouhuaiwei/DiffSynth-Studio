@@ -94,13 +94,22 @@ class WanCrossAttentionProcessor(nn.Module):
         # ---- 帧对齐分支（wav2vec）----
         if audio_proj is not None:
             if audio_proj.dim() == 3:
+                if latents_num_frames is not None and audio_proj.shape[1] != latents_num_frames:
+                    audio_proj = F.interpolate(
+                        audio_proj.transpose(1, 2),
+                        size=latents_num_frames,
+                        mode="linear",
+                        align_corners=False,
+                    ).transpose(1, 2)
                 audio_proj = audio_proj.unsqueeze(2)  # [B, T, 1, C]
             if audio_proj.dim() != 4:
                 raise ValueError(f"audio_proj must be [B,T,C] or [B,T,N,C], got {tuple(audio_proj.shape)}")
 
             t = latents_num_frames if latents_num_frames is not None else audio_proj.shape[1]
             if t != audio_proj.shape[1]:
-                raise ValueError(f"latents_num_frames({t}) != audio frames({audio_proj.shape[1]})")
+                src_t = audio_proj.shape[1]
+                sample_idx = torch.linspace(0, src_t - 1, t, device=audio_proj.device).round().long()
+                audio_proj = audio_proj.index_select(1, sample_idx)
             if q.shape[1] % t != 0:
                 raise ValueError(f"video tokens {q.shape[1]} cannot be evenly split by frames {t}")
 
