@@ -77,7 +77,7 @@ class WanCrossAttentionProcessor(nn.Module):
         b = x.size(0)
 
         # ---- 原始 I2V cross-attn ----
-        if attn.has_image_input:
+        if attn.has_image_input and context.shape[1] > 257:
             context_img = context[:, :257]
             context_txt = context[:, 257:]
         else:
