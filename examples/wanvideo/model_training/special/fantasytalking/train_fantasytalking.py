@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 from diffsynth import ModelManager, WanVideoPipeline
+from diffsynth.core.data.operators import LoadVideo, ImageCropAndResize
 from diffsynth.diffusion import DiffusionTrainingModule, FlowMatchSFTLoss, ModelLogger, launch_training_task
 from diffsynth.models.wan_audio_cross_attention import FantasyTalkingAudioConditionModel
 
@@ -21,15 +22,21 @@ class TensorSampleDataset(Dataset):
     """
     JSONL 每行一个样本，至少包含:
     {
-      "model_input": "/path/to/sample_inputs.pt",  # 必须包含 latents,context
+      "video_path": "/path/to/sample.mp4",
       "audio_path": "/path/to/sample.wav"
+      "prompt": "a person talking"
     }
-    可选: clip_feature, y
     """
 
-    def __init__(self, metadata_path: str):
+    def __init__(self, metadata_path: str, num_frames: int, height: int, width: int):
         self.items = []
         self.load_from_cache = False
+        self.video_loader = LoadVideo(
+            num_frames=num_frames,
+            time_division_factor=4,
+            time_division_remainder=1,
+            frame_processor=ImageCropAndResize(height, width, None, 16, 16),
+        )
         with open(metadata_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -41,9 +48,9 @@ class TensorSampleDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.items[idx]
-        sample = torch.load(item["model_input"], map_location="cpu")
-        sample["audio_path"] = item["audio_path"]
-        return sample
+        prompt = item.get("prompt", item.get("text", ""))
+        video = self.video_loader(item["video_path"])
+        return {"prompt": prompt, "video": video, "audio_path": item["audio_path"]}
 
 def extract_wav2vec_feature(wav2vec, wav2vec_processor, audio_path: str):
     audio, sr = librosa.load(audio_path, sr=16000, mono=True)
@@ -96,6 +103,9 @@ def parse_args():
     parser.add_argument("--audio_in_dim", type=int, default=768)
     parser.add_argument("--global_audio_in_dim", type=int, default=768)
     parser.add_argument("--audio_proj_dim", type=int, default=2048)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--num_frames", type=int, default=81)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -171,14 +181,19 @@ class FantasyTalkingTrainingModule(DiffusionTrainingModule):
 
     def forward(self, data, inputs=None):
         sample = data if inputs is None else inputs
-        input_latents = sample["latents"].to(self.device, dtype=torch.bfloat16)
-        context = sample["context"].to(self.device, dtype=torch.bfloat16)
-        clip_feature = sample.get("clip_feature", None)
-        y = sample.get("y", None)
-        if clip_feature is not None:
-            clip_feature = clip_feature.to(self.device, dtype=torch.bfloat16)
-        if y is not None:
-            y = y.to(self.device, dtype=torch.bfloat16)
+        prompt = sample["prompt"]
+        video = sample["video"]
+        self.pipe.load_models_to_device(["vae", "text_encoder"])
+        input_video = self.pipe.preprocess_video(video)
+        input_latents = self.pipe.vae.encode(input_video, device=self.pipe.device).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        ids, mask = self.pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
+        ids = ids.to(self.pipe.device)
+        mask = mask.to(self.pipe.device)
+        seq_lens = mask.gt(0).sum(dim=1).long()
+        context = self.pipe.text_encoder(ids, mask)
+        for i, v in enumerate(seq_lens):
+            context[:, v:] = 0
 
         wav_feat = extract_wav2vec_feature(self.wav2vec, self.wav2vec_processor, sample["audio_path"])
         emo_feat = extract_emotion2vec_feature(self.emotion2vec, self.emotion_normalize, sample["audio_path"])
@@ -217,8 +232,8 @@ class FantasyTalkingTrainingModule(DiffusionTrainingModule):
             self.pipe,
             input_latents=input_latents,
             context=context,
-            clip_feature=clip_feature,
-            y=y,
+            clip_feature=None,
+            y=None,
             use_gradient_checkpointing=False,
             use_gradient_checkpointing_offload=False,
         )
@@ -227,7 +242,7 @@ class FantasyTalkingTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     args = parse_args()
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    dataset = TensorSampleDataset(args.metadata_path)
+    dataset = TensorSampleDataset(args.metadata_path, num_frames=args.num_frames, height=args.height, width=args.width)
     model = FantasyTalkingTrainingModule(args, device=accelerator.device)
     model_logger = ModelLogger(args.output_dir)
     launch_training_task(
