@@ -182,6 +182,13 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
         audio_proj = self.fantasytalking.get_proj_fea(wav_feat.to(dtype=torch.bfloat16), branch="frame")
         audio_proj_global = self.fantasytalking.get_proj_fea(emo_feat.to(dtype=torch.bfloat16), branch="global")
 
+        latents_num_frames = inputs_shared["input_latents"].shape[2]
+        video_num_frames = latents_num_frames * 4 - 3
+        frame_ranges = self.fantasytalking.split_audio_sequence(audio_proj.shape[1], num_frames=video_num_frames)
+        audio_proj, _ = self.fantasytalking.split_tensor_with_padding(audio_proj, frame_ranges, expand_length=0)
+        audio_proj = audio_proj.to(device=self.pipe.device, dtype=self.pipe.torch_dtype)
+        audio_proj_global = audio_proj_global.to(device=self.pipe.device, dtype=self.pipe.torch_dtype)
+
         base_model_fn = self.pipe.model_fn
 
         def model_fn_audio(
