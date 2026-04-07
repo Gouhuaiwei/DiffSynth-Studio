@@ -184,14 +184,33 @@ class WanFantasyTalkingTrainingModule(DiffusionTrainingModule):
 
         base_model_fn = self.pipe.model_fn
 
-        def model_fn_audio(*args, **kwargs):
-            kwargs["audio_proj"] = audio_proj
-            kwargs["audio_proj_global"] = audio_proj_global
-            kwargs["latents_num_frames"] = inputs_shared["input_latents"].shape[2]
-            kwargs["audio_scale"] = 1.0
-            kwargs["audio_frame_scale"] = 1.0
-            kwargs["audio_global_scale"] = 1.0
-            return base_model_fn(*args, **kwargs)
+        def model_fn_audio(
+            dit,
+            latents=None,
+            timestep=None,
+            context=None,
+            clip_feature=None,
+            y=None,
+            use_gradient_checkpointing=False,
+            use_gradient_checkpointing_offload=False,
+            **kwargs,
+        ):
+            latents_num_frames = latents.shape[2] if latents is not None else inputs_shared["input_latents"].shape[2]
+            return dit(
+                x=latents,
+                timestep=timestep,
+                context=context,
+                clip_feature=clip_feature,
+                y=y,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                audio_proj=audio_proj,
+                audio_proj_global=audio_proj_global,
+                latents_num_frames=latents_num_frames,
+                audio_scale=1.0,
+                audio_frame_scale=1.0,
+                audio_global_scale=1.0,
+            )
 
         self.pipe.model_fn = model_fn_audio
         loss = self.task_to_loss[self.task](self.pipe, inputs_shared, inputs_posi, inputs_nega)
