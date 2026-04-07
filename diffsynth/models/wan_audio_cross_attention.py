@@ -93,20 +93,30 @@ class WanCrossAttentionProcessor(nn.Module):
 
         # ---- 帧对齐分支（wav2vec）----
         if audio_proj is not None:
+            t = latents_num_frames if latents_num_frames is not None else audio_proj.shape[1]
+            video_t = 4 * (t - 1) + 1
             if audio_proj.dim() == 3:
-                if latents_num_frames is not None and audio_proj.shape[1] != latents_num_frames:
+                # 若输入是“视频帧级”音频（例如 81 帧），映射到 latent 帧（例如 21 帧）
+                if latents_num_frames is not None and audio_proj.shape[1] == video_t:
+                    sample_idx = torch.arange(0, video_t, 4, device=audio_proj.device)
+                    audio_proj = audio_proj.index_select(1, sample_idx)
+                elif latents_num_frames is not None and audio_proj.shape[1] != t:
                     audio_proj = F.interpolate(
                         audio_proj.transpose(1, 2),
-                        size=latents_num_frames,
+                        size=video_t,
                         mode="linear",
                         align_corners=False,
                     ).transpose(1, 2)
+                    sample_idx = torch.arange(0, video_t, 4, device=audio_proj.device)
+                    audio_proj = audio_proj.index_select(1, sample_idx)
                 audio_proj = audio_proj.unsqueeze(2)  # [B, T, 1, C]
             if audio_proj.dim() != 4:
                 raise ValueError(f"audio_proj must be [B,T,C] or [B,T,N,C], got {tuple(audio_proj.shape)}")
 
-            t = latents_num_frames if latents_num_frames is not None else audio_proj.shape[1]
-            if t != audio_proj.shape[1]:
+            if latents_num_frames is not None and audio_proj.shape[1] == video_t:
+                sample_idx = torch.arange(0, video_t, 4, device=audio_proj.device)
+                audio_proj = audio_proj.index_select(1, sample_idx)
+            elif t != audio_proj.shape[1]:
                 src_t = audio_proj.shape[1]
                 sample_idx = torch.linspace(0, src_t - 1, t, device=audio_proj.device).round().long()
                 audio_proj = audio_proj.index_select(1, sample_idx)
