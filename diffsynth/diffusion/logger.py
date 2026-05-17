@@ -13,7 +13,13 @@ class ModelLogger:
     def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
         self.num_steps += 1
         if save_steps is not None and self.num_steps % save_steps == 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            loss = kwargs.get("loss", None)
+            if loss is not None:
+                loss_value = float(loss.detach().float().item()) if isinstance(loss, torch.Tensor) else float(loss)
+                file_name = f"step-{self.num_steps}_loss-{loss_value:.6f}.safetensors"
+            else:
+                file_name = f"step-{self.num_steps}.safetensors"
+            self.save_model(accelerator, model, file_name)
 
 
     def on_epoch_end(self, accelerator: Accelerator, model: torch.nn.Module, epoch_id):

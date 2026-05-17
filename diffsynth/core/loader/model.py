@@ -56,6 +56,8 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
             _load_state_dict_into_zero3_model(model, state_dict)
         else:
             model.load_state_dict(state_dict, assign=True)
+        if hasattr(model, "init_missing_parameters"):
+            model.init_missing_parameters(device=device)
         # Why do we call `to()`?
         # Because some models override the behavior of `to()`,
         # especially those from libraries like Transformers.
